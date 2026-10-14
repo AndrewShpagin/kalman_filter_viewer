@@ -221,3 +221,5 @@ __marimo__/
 
 # Generated flight estimates
 result.csv
+result_cpp.csv
+/build*/

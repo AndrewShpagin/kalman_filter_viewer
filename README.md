@@ -2,6 +2,8 @@
 
 Desktop viewer for horizontal drone flight data from semicolon-separated CSV files. It combines vision positions and NED accelerations in a Kalman filter, estimates accelerometer bias in body axes, and replays the results in a moving time window.
 
+The repository also includes a [C++17 header-only filter and CSV runner](cpp/README.md), with per-sample time intervals and dynamically adjustable noise. The runner exports `result_cpp.csv` with the same columns as the Python viewer, plus `dt_s` and `sigma_acc`.
+
 ## Install
 
 Use Python 3.10 or newer with a desktop GUI environment.
