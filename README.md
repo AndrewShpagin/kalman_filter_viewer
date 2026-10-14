@@ -48,6 +48,20 @@ Click **Apply + export** to recalculate the entire flight and save the result. O
 | `+` / `-` | Increase / decrease playback speed |
 | Time slider | Seek and pause |
 
+### Open results in PlotJuggler
+
+Click **Open in PlotJuggler** to apply the current UI parameters, refresh the exported CSV, and launch PlotJuggler with that file. The button becomes available after loading a flight.
+
+The viewer checks an explicit `--plotjuggler` path, `PLOTJUGGLER_PATH`, the remembered executable, `PATH`, and common installation directories. On Windows it also checks the installation registry, Program Files, and per-user installations. If no executable is found, a file dialog asks you to locate the installed `plotjuggler.exe` (or the application executable/AppImage on other systems). A successful launch remembers the path for subsequent sessions. PlotJuggler must already be installed.
+
+```bash
+python kalman_flight_viewer.py --plotjuggler "C:\Program Files\PlotJuggler\plotjuggler.exe"
+```
+
+The launch uses PlotJuggler's [`-d / --datafile` option](https://github.com/PlotJuggler/PlotJuggler/blob/main/plotjuggler_app/main.cpp) with an absolute CSV path. If PlotJuggler shows its CSV import dialog, select `;` as the delimiter and `time_s` as the time column. Subsequent changes in the viewer require reopening or reloading the data in PlotJuggler.
+
+The remembered path is stored in `KalmanFlightViewer/settings.json` under `%LOCALAPPDATA%` on Windows, `~/Library/Application Support` on macOS, or `$XDG_CONFIG_HOME` / `~/.config` on Linux. This is independent of the input CSV directory and repository.
+
 ## CSV input
 
 Use `;` as the separator and at least two data rows. Decimal points and decimal commas are accepted. Input positions are horizontal NED coordinates; horizontal accelerations must already be in NED.
@@ -96,3 +110,11 @@ Each horizontal axis uses a position/velocity Kalman filter. Position measuremen
 Bias is a cumulative least-squares estimate in body X/Y, outside the Kalman state. The full quaternion rotates this estimate into NED before acceleration correction. Bias fitting uses NED velocity increments and the corresponding attitude, avoiding direct subtraction of rotating-frame velocity from an integral of body acceleration.
 
 Body-Z bias is assumed zero, vertical motion is not fused, and bias uncertainty is not included in the Kalman covariance. Initial X/Y velocities default to zero and can be set with `--vx0` / `--vy0`. Once frame conventions are determined, filtering is a forward pass; the moving display window does not reset the estimate. Further equations and assumptions are in the script's module docstring.
+
+## Tests
+
+```bash
+python -m unittest discover -s tests -v
+```
+
+The PlotJuggler integration checks executable discovery, remembered paths, UI parameter application, export/launch errors, and argument handling. The subprocess test uses a small recording executable; it does not require PlotJuggler to be installed.

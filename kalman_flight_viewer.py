@@ -83,6 +83,11 @@ result.csv is saved next to the newly opened file; an explicit --export path
 stays fixed. Cancel or a failed load keeps the previous flight available.
 The initial CSV argument is optional in GUI mode. Until a file is loaded,
 playback/export are inactive, parameters remain editable, and no CSV is written.
+Open in PlotJuggler applies the current fields, exports the result, and starts
+PlotJuggler with -d and the absolute CSV path. It searches the saved path, PATH,
+Windows installation registry entries and common installation directories.
+If needed, select the installed executable once; the path is remembered in
+the user's settings directory. --plotjuggler PATH overrides automatic lookup.
 Drag/drop works with TkAgg (tkinterdnd2 >= 0.6) and QtAgg (PySide/PyQt).
 File paths with spaces and non-ASCII characters are supported. Drop one file
 at a time; the source is opened, never moved. --no-gui requires an input CSV.
@@ -95,7 +100,11 @@ from __future__ import annotations
 
 import argparse
 import csv
+import json
 import math
+import os
+import shutil
+import subprocess
 import sys
 import tempfile
 import time
@@ -471,11 +480,142 @@ def export_estimates(path: Path, result: dict[str, np.ndarray]) -> None:
             temporary.unlink(missing_ok=True)
 
 
+def viewer_settings_path() -> Path:
+    if sys.platform == 'win32':
+        base = Path(os.environ.get('LOCALAPPDATA') or Path.home() / 'AppData' / 'Local')
+    elif sys.platform == 'darwin':
+        base = Path.home() / 'Library' / 'Application Support'
+    else:
+        base = Path(os.environ.get('XDG_CONFIG_HOME') or Path.home() / '.config')
+    return base / 'KalmanFlightViewer' / 'settings.json'
+
+
+def saved_plotjuggler_path() -> str | None:
+    try:
+        settings = json.loads(viewer_settings_path().read_text(encoding='utf-8'))
+        value = settings.get('plotjuggler_path') if isinstance(settings, dict) else None
+        return value if isinstance(value, str) else None
+    except (OSError, ValueError):
+        return None
+
+
+def save_plotjuggler_path(path: Path) -> None:
+    settings_path = viewer_settings_path()
+    settings_path.parent.mkdir(parents=True, exist_ok=True)
+    settings_path.write_text(json.dumps({'plotjuggler_path': str(path)}, indent=2) + '\n',
+                             encoding='utf-8')
+
+
+def resolve_plotjuggler_executable(value) -> Path | None:
+    if not value:
+        return None
+    try:
+        path = Path(os.path.expandvars(str(value).strip().strip('"'))).expanduser()
+        candidates = ([path / 'Contents' / 'MacOS' / name
+                       for name in ('plotjuggler', 'PlotJuggler')]
+                      if path.suffix.lower() == '.app' else [path])
+        for candidate in candidates:
+            if candidate.is_file() and (
+                    candidate.suffix.lower() == '.exe' if sys.platform == 'win32'
+                    else os.access(candidate, os.X_OK)):
+                return candidate.resolve()
+    except (OSError, ValueError):
+        pass
+    return None
+
+
+def windows_plotjuggler_locations():
+    """Read only PlotJuggler's App Paths / uninstall entries, including 32-bit views."""
+    if sys.platform != 'win32':
+        return
+    import winreg
+    for hive in (winreg.HKEY_CURRENT_USER, winreg.HKEY_LOCAL_MACHINE):
+        for view in (winreg.KEY_WOW64_64KEY, winreg.KEY_WOW64_32KEY):
+            try:
+                with winreg.OpenKey(hive, r'Software\Microsoft\Windows\CurrentVersion\App Paths\plotjuggler.exe',
+                                    0, winreg.KEY_READ | view) as key:
+                    yield winreg.QueryValueEx(key, '')[0]
+            except OSError:
+                pass
+            try:
+                with winreg.OpenKey(hive, r'Software\Microsoft\Windows\CurrentVersion\Uninstall',
+                                    0, winreg.KEY_READ | view) as parent:
+                    for i in range(winreg.QueryInfoKey(parent)[0]):
+                        try:
+                            with winreg.OpenKey(parent, winreg.EnumKey(parent, i)) as key:
+                                name = str(winreg.QueryValueEx(key, 'DisplayName')[0])
+                                if 'plotjuggler' not in name.lower():
+                                    continue
+                                for field in ('InstallLocation', 'DisplayIcon'):
+                                    try:
+                                        value = str(winreg.QueryValueEx(key, field)[0])
+                                        if field == 'DisplayIcon':
+                                            value = value.rsplit(',', 1)[0].strip('"')
+                                        if value:
+                                            yield value
+                                    except OSError:
+                                        pass
+                        except OSError:
+                            continue
+            except OSError:
+                pass
+
+
+def common_plotjuggler_locations():
+    if sys.platform == 'win32':
+        for value in windows_plotjuggler_locations():
+            root = Path(os.path.expandvars(str(value).strip('"')))
+            yield root
+            yield root / 'plotjuggler.exe'
+            yield root / 'bin' / 'plotjuggler.exe'
+        roots = [Path(os.environ.get(name) or default) for name, default in (
+            ('ProgramFiles', r'C:\Program Files'), ('ProgramFiles(x86)', r'C:\Program Files (x86)'),
+            ('LOCALAPPDATA', str(Path.home() / 'AppData' / 'Local')))]
+        roots += [roots[-1] / 'Programs', Path.home(), Path.home() / 'Downloads',
+                  Path(os.environ.get('SystemDrive', 'C:') + '/')]
+        patterns = ('PlotJuggler*/plotjuggler.exe', 'PlotJuggler*/bin/plotjuggler.exe')
+    elif sys.platform == 'darwin':
+        roots = [Path('/Applications'), Path.home() / 'Applications']
+        patterns = ('PlotJuggler*.app',)
+        for root in (Path('/opt/homebrew/bin'), Path('/usr/local/bin')):
+            yield root / 'plotjuggler'
+    else:
+        for root in (Path('/usr/bin'), Path('/usr/local/bin'), Path('/snap/bin'),
+                     Path.home() / '.local' / 'bin'):
+            yield root / 'plotjuggler'
+        roots = [Path('/opt'), Path.home() / 'Applications', Path.home() / 'Downloads']
+        patterns = ('PlotJuggler*/bin/plotjuggler', 'PlotJuggler*/plotjuggler',
+                    '*[Pp]lot[Jj]uggler*.AppImage', 'ros/*/lib/plotjuggler/plotjuggler')
+    # Bounded directory patterns: do not crawl the whole disk or block the UI for minutes.
+    for root in roots:
+        for pattern in patterns:
+            try:
+                yield from sorted(root.glob(pattern), reverse=True)
+            except OSError:
+                continue
+
+
+def find_plotjuggler(preferred=None) -> Path | None:
+    for value in (preferred, os.environ.get('PLOTJUGGLER_PATH'), saved_plotjuggler_path()):
+        found = resolve_plotjuggler_executable(value)
+        if found is not None:
+            return found
+    for command in ('plotjuggler', 'PlotJuggler', 'plotjuggler.exe'):
+        found = resolve_plotjuggler_executable(shutil.which(command))
+        if found is not None:
+            return found
+    for value in common_plotjuggler_locations():
+        found = resolve_plotjuggler_executable(value)
+        if found is not None:
+            return found
+    return None
+
+
 class FlightViewer:
     def __init__(self, result, cfg, window=10.0, playback_speed=1.0,
                  start=0.0, paused=False, title='Flight', data=None,
                  export_path=None, attitude=None, input_path=None,
-                 export_follows_input=False):
+                 export_follows_input=False, plotjuggler_path=None):
         import matplotlib.pyplot as plt
         from matplotlib.ticker import MaxNLocator, ScalarFormatter
         from matplotlib.widgets import Button, Slider, TextBox
@@ -491,6 +631,8 @@ class FlightViewer:
         self.input_path = Path(input_path).resolve() if input_path is not None else None
         self.input_paths = {self.input_path} if self.input_path is not None else set()
         self.export_follows_input = export_follows_input
+        self.plotjuggler_path = plotjuggler_path
+        self.external_processes = []
         self.duration = float(result['time'][-1]) if result is not None else 0.0
         self._drop_pending = False
         self._closed = False
@@ -530,6 +672,9 @@ class FlightViewer:
         self.apply_button.on_clicked(self.apply_parameters)
         self.open_button = Button(self.fig.add_axes([0.815, 0.89, 0.16, 0.04]), 'Open CSV')
         self.open_button.on_clicked(self.open_csv)
+        self.plotjuggler_button = Button(self.fig.add_axes([0.815, 0.788, 0.16, 0.04]),
+                                        'Open in PlotJuggler')
+        self.plotjuggler_button.on_clicked(self.open_in_plotjuggler)
         if self.attitude is not None:
             frame_report = self.attitude.report
             self.message.set_text(
@@ -600,7 +745,7 @@ class FlightViewer:
         self.empty_hint.set_visible(not loaded)
         for ax in self.axes.flat:
             ax.set_visible(loaded)
-        for control in (self.slider, self.button, self.apply_button):
+        for control in (self.slider, self.button, self.apply_button, self.plotjuggler_button):
             control.set_active(loaded)
             control.ax.set_alpha(1.0 if loaded else 0.35)
             control.label.set_color('black' if loaded else '#aaaaaa')
@@ -788,13 +933,17 @@ class FlightViewer:
         self.drop_status.set_text('Drag & drop: drop one CSV anywhere in this window to open it.')
 
     def choose_csv_path(self):
-        """Use the active desktop backend's native file dialog; no GUI imports in CLI mode."""
         initial_dir = self.input_path.parent if self.input_path else self.export_path.resolve().parent
+        return self.choose_file('Open flight CSV', initial_dir, 'CSV files (*.csv);;All files (*)',
+                                [('CSV files', '*.csv'), ('All files', '*')])
+
+    def choose_file(self, title, initial_dir, qt_filter, tk_filetypes):
+        """Use the active desktop backend's native file dialog; no GUI imports in CLI mode."""
         parent = getattr(self.fig.canvas.manager, 'window', None)
         if 'qt' in self.plt.get_backend().lower():
             from matplotlib.backends.qt_compat import QtWidgets
             filename, _ = QtWidgets.QFileDialog.getOpenFileName(
-                parent, 'Open flight CSV', str(initial_dir), 'CSV files (*.csv);;All files (*)')
+                parent, title, str(initial_dir), qt_filter)
             return filename
         try:
             import tkinter as tk
@@ -808,11 +957,75 @@ class FlightViewer:
                 root.withdraw()
                 parent = root
             return filedialog.askopenfilename(
-                parent=parent, title='Open flight CSV', initialdir=str(initial_dir),
-                filetypes=[('CSV files', '*.csv'), ('All files', '*')])
+                parent=parent, title=title, initialdir=str(initial_dir), filetypes=tk_filetypes)
         finally:
             if root is not None:
                 root.destroy()
+
+    def choose_plotjuggler_path(self):
+        initial_dir = (Path(self.plotjuggler_path).parent if self.plotjuggler_path
+                       else Path.home())
+        return self.choose_file(
+            'Locate installed PlotJuggler executable (not its installer)', initial_dir,
+            'Executables (*.exe);;All files (*)' if sys.platform == 'win32'
+            else 'All files (*)',
+            [('Executable', '*.exe'), ('All files', '*')] if sys.platform == 'win32'
+            else [('All files', '*')])
+
+    def open_in_plotjuggler(self, _event=None):
+        if self.result is None:
+            return False
+        was_paused = self.paused
+        self.paused = True
+        try:
+            cfg = self.config_from_fields()
+            self.message.set_color('#555555')
+            self.message.set_text('Looking for PlotJuggler...')
+            self.draw(force=True)
+            executable = find_plotjuggler(self.plotjuggler_path)
+            if executable is None:
+                self.message.set_text('PlotJuggler not found. Select its installed executable.')
+                self.fig.canvas.draw()
+                selected = self.choose_plotjuggler_path()
+                if not selected:
+                    self.paused = was_paused
+                    self.message.set_text('PlotJuggler selection cancelled.')
+                    return False
+                executable = resolve_plotjuggler_executable(selected)
+                if executable is None:
+                    raise ValueError('Selected file is not an executable. Select the installed PlotJuggler application.')
+            # Apply edited parameters, or restore the current export if it was moved/changed.
+            if cfg != self.cfg:
+                if not self.apply_parameters():
+                    return False
+            else:
+                export_estimates(self.export_path, self.result)
+            command = [str(executable), '-d', str(self.export_path.resolve())]
+            options = {'cwd': str(executable.parent), 'shell': False}
+            if sys.platform == 'win32':
+                options['creationflags'] = subprocess.CREATE_NEW_PROCESS_GROUP
+            else:
+                options['start_new_session'] = True
+            process = subprocess.Popen(command, **options)
+            self.external_processes.append(process)
+            self.plotjuggler_path = executable
+            self.message.set_color('#257343')
+            self.message.set_text(f'PlotJuggler started: {self.export_path.name[:65]}')
+            print(f'PlotJuggler: {executable}; data: {self.export_path.resolve()}')
+            try:
+                save_plotjuggler_path(executable)
+            except OSError as error:
+                self.message.set_text('PlotJuggler started; could not remember its path for the next session.')
+                print(f'Could not save PlotJuggler path: {error}', file=sys.stderr)
+            return True
+        except Exception as error:
+            self.message.set_color('#b42318')
+            self.message.set_text('PlotJuggler: ' + str(error).replace('\n', ' ')[:135])
+            print(f'Open in PlotJuggler failed: {error}', file=sys.stderr)
+            return False
+        finally:
+            self.last_clock = time.perf_counter()
+            self.draw(force=True)
 
     def open_csv(self, _event=None):
         was_paused = self.paused
@@ -917,6 +1130,7 @@ class FlightViewer:
         return True
 
     def tick(self):
+        self.external_processes = [p for p in self.external_processes if p.poll() is None]
         now = time.perf_counter()
         elapsed = now - self.last_clock
         self.last_clock = now
@@ -993,6 +1207,8 @@ def parse_args(argv=None):
     parser.add_argument('--paused', action='store_true', help='Start with playback paused')
     parser.add_argument('--export', type=Path,
                         help='Fixed output CSV (default: result.csv next to current input); overwritten on startup, Open and Apply')
+    parser.add_argument('--plotjuggler', type=Path,
+                        help='Path to the PlotJuggler executable; otherwise locate automatically or choose in the UI')
     parser.add_argument('--snapshot', type=Path, help='Save the window at --start as an image')
     parser.add_argument('--no-gui', action='store_true', help='Compute/export without opening a desktop window')
     args = parser.parse_args(argv)
@@ -1067,7 +1283,8 @@ def main(argv=None):
                                   args.start, args.paused or args.no_gui,
                                   str(args.csv) if args.csv is not None else 'Flight',
                                   data=data, export_path=args.export, attitude=attitude,
-                                  input_path=args.csv, export_follows_input=args.export_follows_input)
+                                  input_path=args.csv, export_follows_input=args.export_follows_input,
+                                  plotjuggler_path=args.plotjuggler)
             if args.snapshot is not None:
                 viewer.fig.savefig(args.snapshot, dpi=130)
                 print(f'Snapshot: {args.snapshot}')
