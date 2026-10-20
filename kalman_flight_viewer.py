@@ -612,6 +612,51 @@ def find_plotjuggler(preferred=None) -> Path | None:
 
 
 class FlightViewer:
+    viewer_name = 'Kalman flight viewer'
+    replay_name = 'Kalman replay'
+    default_export_name = 'result.csv'
+    panel_titles = ('Position', 'Velocity', 'Bias', 'Acceleration')
+
+    def parameter_specs(self, cfg):
+        return (
+            ('sigma_acc', 'Accel sigma (m/s^2)', cfg.sigma_acc),
+            ('initial_vel_sigma', 'Initial speed sigma (m/s)', cfg.initial_vel_sigma),
+            ('min_pos_sigma', 'Min position sigma (m)', cfg.min_pos_sigma),
+            ('height_percent', 'Height error (%)', 100.0 * cfg.k_height),
+            ('coord_scale', 'Coordinate multiplier', cfg.coord_scale),
+        )
+
+    def plot_groups(self, axis):
+        return (
+            [('measured_position', 'Vision x multiplier', '#7e8793', '--'),
+             ('position', 'Kalman', '#0072B2', '-')],
+            [('velocity', 'Estimated speed', '#009E73', '-')],
+            [('bias_body', 'Body ' + ('X' if axis == 0 else 'Y'), '#D55E00', '-'),
+             ('bias', 'NED ' + ('X' if axis == 0 else 'Y'), '#0072B2', '--')],
+            [('raw_acceleration', 'Raw', '#8c9199', '--'),
+             ('corrected_acceleration', 'Raw - bias used', '#8e44ad', '-')],
+        )
+
+    def parameter_text(self):
+        return (f'Active: sigma_pos = max({self.cfg.min_pos_sigma:g} m, '
+                f'{100 * self.cfg.k_height:g}% of height); '
+                f'sigma_acc={self.cfg.sigma_acc:g} m/s^2; '
+                f'sigma_v0={self.cfg.initial_vel_sigma:g} m/s. '
+                f'coord_scale={self.cfg.coord_scale:g}; '
+                f'dt={self.cfg.dt:g} s; window={self.window:g} s.')
+
+    def status_details(self, index):
+        return f'sigma_position={self.result["sigma_position"][index]:.2f} m'
+
+    def run_estimate(self, data, cfg, attitude):
+        return estimate(data, cfg, attitude)
+
+    def save_estimates(self, path, result):
+        export_estimates(path, result)
+
+    def after_apply(self):
+        """Hook for replay modes with editable display/time settings."""
+
     def __init__(self, result, cfg, window=10.0, playback_speed=1.0,
                  start=0.0, paused=False, title='Flight', data=None,
                  export_path=None, attitude=None, input_path=None,
@@ -627,7 +672,7 @@ class FlightViewer:
         self.data = data
         self.attitude = attitude if attitude is not None else (
             check_attitude(data, cfg) if data is not None else None)
-        self.export_path = Path(export_path) if export_path is not None else Path('result.csv')
+        self.export_path = Path(export_path) if export_path is not None else Path(self.default_export_name)
         self.input_path = Path(input_path).resolve() if input_path is not None else None
         self.input_paths = {self.input_path} if self.input_path is not None else set()
         self.export_follows_input = export_follows_input
@@ -641,29 +686,26 @@ class FlightViewer:
         self.paused = paused or self.current_time >= self.duration
         self.last_clock = time.perf_counter()
         self.last_index = -1
-        self.fig, self.axes = plt.subplots(2, 4, figsize=(17, 9.5), sharex=True)
-        self.fig.subplots_adjust(left=0.065, right=0.985, top=0.745,
+        specs = self.parameter_specs(cfg)
+        extra_rows = (len(specs) - 1) // 5
+        controls_shift = 0.09 * extra_rows
+        self.fig, self.axes = plt.subplots(2, 4, figsize=(17, 9.5 + extra_rows), sharex=True)
+        self.fig.subplots_adjust(left=0.065, right=0.985, top=0.745 - controls_shift,
                                  bottom=0.20, wspace=0.33, hspace=0.32)
         manager = self.fig.canvas.manager
         if manager is not None:
-            manager.set_window_title('Kalman flight viewer')
-        self.fig.suptitle(Path(title).name + ' - Kalman replay' if result is not None
-                          else 'Kalman flight viewer', y=0.98, fontsize=16)
+            manager.set_window_title(self.viewer_name)
+        self.fig.suptitle(Path(title).name + ' - ' + self.replay_name if result is not None
+                          else self.viewer_name, y=0.98, fontsize=16)
         self.status = self.fig.text(0.065, 0.935, '', fontsize=11)
-        self.parameter_summary = self.fig.text(0.065, 0.812, '', fontsize=10, color='#555555')
-        self.message = self.fig.text(0.065, 0.782, '', fontsize=10)
+        self.parameter_summary = self.fig.text(0.065, 0.812 - controls_shift, '', fontsize=10, color='#555555')
+        self.message = self.fig.text(0.065, 0.782 - controls_shift, '', fontsize=10)
         self.fields = {}
-        specs = (
-            ('sigma_acc', 'Accel sigma (m/s^2)', cfg.sigma_acc),
-            ('initial_vel_sigma', 'Initial speed sigma (m/s)', cfg.initial_vel_sigma),
-            ('min_pos_sigma', 'Min position sigma (m)', cfg.min_pos_sigma),
-            ('height_percent', 'Height error (%)', 100.0 * cfg.k_height),
-            ('coord_scale', 'Coordinate multiplier', cfg.coord_scale),
-        )
-        for col, (key, label, value) in enumerate(specs):
+        for number, (key, label, value) in enumerate(specs):
+            row, col = divmod(number, 5)
             left = 0.065 + 0.148 * col
-            self.fig.text(left, 0.89, label, fontsize=10)
-            widget = TextBox(self.fig.add_axes([left, 0.842, 0.128, 0.035]),
+            self.fig.text(left, 0.89 - row * 0.09, label, fontsize=10)
+            widget = TextBox(self.fig.add_axes([left, 0.842 - row * 0.09, 0.128, 0.035]),
                              '', initial=f'{value:g}')
             self.fields[key] = widget
             widget.on_text_change(self.parameters_edited)
@@ -685,17 +727,9 @@ class FlightViewer:
             self.message.set_text('Set parameters above, then open or drop a flight CSV.')
         self.bindings = []
         for j, direction in enumerate(('X / North', 'Y / East')):
-            groups = (
-                [('measured_position', 'Vision x multiplier', '#7e8793', '--'),
-                 ('position', 'Kalman', '#0072B2', '-')],
-                [('velocity', 'Estimated speed', '#009E73', '-')],
-                [('bias_body', 'Body ' + ('X' if j == 0 else 'Y'), '#D55E00', '-'),
-                 ('bias', 'NED ' + ('X' if j == 0 else 'Y'), '#0072B2', '--')],
-                [('raw_acceleration', 'Raw', '#8c9199', '--'),
-                 ('corrected_acceleration', 'Raw - bias used', '#8e44ad', '-')],
-            )
+            groups = self.plot_groups(j)
             for col, (title_text, unit, traces) in enumerate(zip(
-                ('Position', 'Velocity', 'Bias', 'Acceleration'),
+                self.panel_titles,
                 ('m', 'm/s', 'm/s^2', 'm/s^2'), groups)):
                 ax = self.axes[j, col]
                 ax.set_title(f'{direction}: {title_text}' if col != 2
@@ -752,13 +786,7 @@ class FlightViewer:
 
     def draw(self, force=False):
         result = self.result
-        self.parameter_summary.set_text(
-            f'Active: sigma_pos = max({self.cfg.min_pos_sigma:g} m, '
-            f'{100 * self.cfg.k_height:g}% of height); '
-            f'sigma_acc={self.cfg.sigma_acc:g} m/s^2; '
-            f'sigma_v0={self.cfg.initial_vel_sigma:g} m/s. '
-            f'coord_scale={self.cfg.coord_scale:g}; '
-            f'dt={self.cfg.dt:g} s; window={self.window:g} s.')
+        self.parameter_summary.set_text(self.parameter_text())
         if result is None:
             self.status.set_text('No CSV loaded')
             self.button.label.set_text('Play')
@@ -793,7 +821,7 @@ class FlightViewer:
         self.status.set_text(
             f'{mode}   {self.playback_speed:g}x    t={right:.2f} / {self.duration:.2f} s    '
             f'height={result["height"][index]:.2f} m    '
-            f'sigma_position={result["sigma_position"][index]:.2f} m')
+            + self.status_details(index))
         self.button.label.set_text('Play' if self.paused else 'Pause')
         # Updating the display must not trigger the seek callback or extra draws.
         self.slider.eventson = False
@@ -999,7 +1027,7 @@ class FlightViewer:
                 if not self.apply_parameters():
                     return False
             else:
-                export_estimates(self.export_path, self.result)
+                self.save_estimates(self.export_path, self.result)
             command = [str(executable), '-d', str(self.export_path.resolve())]
             options = {'cwd': str(executable.parent), 'shell': False}
             if sys.platform == 'win32':
@@ -1056,7 +1084,7 @@ class FlightViewer:
         try:
             cfg = self.config_from_fields()
             path = Path(path).resolve()
-            export_path = path.parent / 'result.csv' if self.export_follows_input else self.export_path
+            export_path = path.parent / self.default_export_name if self.export_follows_input else self.export_path
             if export_path.resolve() in self.input_paths | {path}:
                 raise ValueError('Export would overwrite an input CSV. Choose a different file/output path.')
             self.message.set_color('#555555')
@@ -1064,8 +1092,8 @@ class FlightViewer:
             self.fig.canvas.draw()
             data, _ = read_flight(path)
             attitude = check_attitude(data, cfg)
-            result = estimate(data, cfg, attitude)
-            export_estimates(export_path, result)
+            result = self.run_estimate(data, cfg, attitude)
+            self.save_estimates(export_path, result)
         except (ValueError, OSError, RuntimeError, OverflowError) as error:
             self.message.set_color('#b42318')
             self.message.set_text('Not opened: ' + str(error).replace('\n', ' ')[:145])
@@ -1074,6 +1102,7 @@ class FlightViewer:
             self.draw(force=True)
             return False
         self.cfg, self.data, self.attitude, self.result = cfg, data, attitude, result
+        self.after_apply()
         self.input_path, self.export_path = path, export_path
         self.input_paths.add(path)
         self.duration = float(result['time'][-1])
@@ -1085,7 +1114,7 @@ class FlightViewer:
         self.slider.ax.set_xlim(0.0, self.duration)
         self.slider.vline.set_xdata([0.0, 0.0])
         self.set_loaded_controls()
-        self.fig.suptitle(path.name + ' - Kalman replay', y=0.98, fontsize=16)
+        self.fig.suptitle(path.name + ' - ' + self.replay_name, y=0.98, fontsize=16)
         report = attitude.report
         self.message.set_color('#257343')
         self.message.set_text(
@@ -1107,9 +1136,9 @@ class FlightViewer:
             self.message.set_color('#555555')
             self.message.set_text('Recalculating the full flight and saving CSV...')
             self.fig.canvas.draw()
-            result = estimate(self.data, cfg, self.attitude)
+            result = self.run_estimate(self.data, cfg, self.attitude)
             # Only commit new settings/curves after the corresponding CSV is saved.
-            export_estimates(self.export_path, result)
+            self.save_estimates(self.export_path, result)
         except (ValueError, OSError, OverflowError) as error:
             self.message.set_color('#b42318')
             detail = str(error).replace('\n', ' ')
@@ -1120,12 +1149,15 @@ class FlightViewer:
             self.draw(force=True)
             return False
         self.cfg, self.result = cfg, result
+        self.after_apply()
+        self.duration = float(result['time'][-1])
+        self.current_time = min(self.current_time, self.duration)
+        self.slider.valmax = self.duration
+        self.slider.ax.set_xlim(0.0, self.duration)
         self.last_clock = time.perf_counter()
         self.message.set_color('#257343')
         self.message.set_text(f'Applied. Saved {len(result["time"])} rows to {self.export_path.name}.')
-        print(f'Updated {self.export_path}: sigma_acc={cfg.sigma_acc:g}, '
-              f'sigma_v0={cfg.initial_vel_sigma:g}, min_sigma_pos={cfg.min_pos_sigma:g}, '
-              f'height_error={100 * cfg.k_height:g}%, coord_scale={cfg.coord_scale:g}')
+        print(f'Updated {self.export_path}: {self.parameter_text()}')
         self.draw(force=True)
         return True
 
