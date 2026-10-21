@@ -4,7 +4,7 @@ This Python experiment estimates horizontal velocity from NED acceleration, anch
 
 ## Run
 
-Use the repository's existing dependencies and keep `velocity_flight_viewer.py` and `kalman_flight_viewer.py` together. The new script imports the CSV/attitude helpers and desktop controls from the latter.
+Use the repository's existing dependencies and keep `velocity_flight_viewer.py`, `kalman_flight_viewer.py` and `viewer_widgets.py` together. The new script imports the shared CSV/attitude helpers and desktop controls.
 
 ```bash
 python -m pip install -r requirements.txt
@@ -39,6 +39,8 @@ The default visible plot width is 10 s. This is independent of the 18 s estimati
 
 **Apply + export** recomputes the whole flight from row zero using the edited settings, saves the CSV, and pauses at the current time. Editing fields does not change the active result until Apply, Open CSV, or Open in PlotJuggler. Reapplying a coordinate scale always starts from the original positions. Invalid parameters or a failed export retain the previously computed result.
 
+Typing, cursor movement and changing field focus repaint only the controls on TkAgg/QtAgg. They do not redraw the eight plots, recalculate estimates or write the CSV, even when replay was already paused. Other backends without partial drawing fall back to a full redraw.
+
 Initial NED speed is zero by default. If the log starts while moving, set `--vx0` and `--vy0` in m/s. These are the assumed starting speed for cumulative bias fitting, not a velocity measurement from a later frame.
 
 ## Input and output
@@ -49,11 +51,14 @@ Quaternion normalization, direction checks, yaw-unit checks, and optional raw-IM
 
 Opening or applying automatically writes **`result_velocity.csv` next to the input**. An explicit `--export` path stays fixed when opening another flight. Source files are protected from output-path collisions. The output is replaced atomically, without publishing a partial CSV.
 
-Useful output columns:
+Output columns (suffix `_x/y` means two separate columns). Positions, velocities,
+accelerations and NED biases use X=North, Y=East; `bias_body_*` uses rotating body
+axes. Body Z bias is assumed zero. All means refer to the current past window.
 
 | Columns | Meaning |
 | --- | --- |
-| `time_s`, `dt` | Row-based elapsed time and sample step |
+| `time_s`, `dt` | Row-based elapsed time and sample step, seconds; input timestamps are not used |
+| `mheight` | Input height above ground, metres; logged but not used to weight this velocity estimator |
 | `vis_x/y`, `vis_scaled_x/y` | Original and scaled positions |
 | `estimated_speed_x/y`, `niacc.x/y` | Estimated velocity; the two naming schemes contain identical values |
 | `forward_position_x/y` | Scaled position plus `lead * estimated_speed` |
@@ -68,7 +73,48 @@ Useful output columns:
 | `acc_raw_x/y`, `acc_used_x/y` | Raw and bias-corrected NED accelerations |
 | `window_complete`, `window_span_s` | Whether the full requested window exists, and available span |
 
-The export also records raw acceleration integrals, normalized input quaternions, yaw checks, body-bias normal equations, and active numerical parameters. It contains no Kalman covariances or gains.
+Position columns are in metres. All speed, offset and acceleration-integral
+columns are in m/s, including **`window_integral_acc_x/y`** despite its name.
+Acceleration and bias columns are in m/s². `window_span_s` is in seconds and
+`window_complete` is 0 or 1.
+
+For either axis, the exported identities are:
+
+```text
+velocity_offset = mean_visual_speed - mean_inertial_speed
+estimated_speed = window_integral_acc + velocity_offset
+forward_position = vis_scaled + lead * estimated_speed
+```
+
+`mean_inertial_speed` is the weighted mean over the window, not the velocity
+at the window centre. The integral starts from zero at its left boundary, so
+its absolute value depends on that boundary; `velocity_offset` restores the
+velocity reference. `bias_*_used` is the previous estimate used on this step,
+while `bias_*_estimated` is the newly updated estimate for the following step.
+
+Additional parameters and diagnostics:
+
+| Columns | Meaning / units |
+| --- | --- |
+| `fade_in`, `flat`, `fade_out` | Old-edge fade, full-weight part, recent-edge fade durations, seconds |
+| `lead` | Forward-position horizon, seconds; not the sample step |
+| `coord_scale` | Visual-coordinate multiplier, dimensionless |
+| `weight_sum` | Sum of interval fade weights **before** normalization; dimensionless, not a confidence score |
+| `learn_bias` | 1 learns body bias; 0 holds the entered initial bias fixed |
+| `bias_x0`, `bias_y0` | Initial body bias, m/s² |
+| `vx0`, `vy0` | Assumed initial NED speed, m/s |
+| `integral_acc_raw_x/y` | Integral of raw NED acceleration since row zero, without bias subtraction, m/s |
+| `quat_x_normalized_input`, `quat_y_normalized_input`, `quat_z_normalized_input`, `quat_w_normalized_input` | Unit-length input quaternion, dimensionless; retains the input direction convention |
+| `yaw_csv_deg` | Input yaw converted to degrees |
+| `yaw_quat_deg` | Yaw from the selected body-to-NED quaternion rotation, degrees |
+| `yaw_error_deg` | `yaw_quat_deg - yaw_csv_deg`, wrapped to [-180, 180) degrees |
+| `bias_fit_normal_xx`, `bias_fit_normal_xy`, `bias_fit_normal_yy` | Symmetric 2×2 cumulative body-bias fit matrix, seconds |
+| `bias_fit_rhs_x/y` | Right-hand side of that fit, m/s; `normal * bias_body = rhs` in observable directions |
+
+Settings are repeated on every row for reproducibility. There are no Kalman
+covariances or gains in this export. Row zero initializes the result; integration
+and bias learning begin at row one. The first visual-interval speed is the
+assumed initial speed rather than a measured difference.
 
 ```bash
 # Compute without opening a desktop window.
@@ -139,6 +185,49 @@ The new `b_i` is used at sample `i+1`. There is no same-sample iteration or use 
 Row zero initializes state without integration or bias learning. During startup use the available past intervals and the same fade slopes, normalize their actual weights, and mark `window_complete=0`. Overlapping fades produce a shorter triangular window. Startup estimates are shown, rather than padding the past or waiting 18 seconds for the first output.
 
 This is an experiment with coupled velocity and bias estimates, not an independent measurement of accelerometer bias. Visual-motion errors and attitude errors can enter the learned bias. Correct arithmetic and consistent synthetic motion do not establish closed-loop flight stability or accuracy on a real log without ground truth.
+
+## Requirement for the final variable-time implementation
+
+The current CSV experiment uses one fixed `dt` (default 0.05 s). It does **not**
+yet read variable sample timestamps. The eventual streaming implementation must
+use actual elapsed time both in integration and in the two means, rather than
+giving a densely sampled part of the window more influence just because it has
+more samples.
+
+For interval `i`, let `dt_i = t_i - t_(i-1) > 0`, and evaluate the same fade
+`w_i` at that interval's time midpoint for both signals. With acceleration held
+constant within each interval, the midpoint approximation is:
+
+```text
+I_i = I_(i-1) + (a_raw_i - M_i * previous_body_bias) * dt_i
+I_mid_i = (I_(i-1) + I_i) / 2
+D = sum(w_i * dt_i)
+
+mean_visual_speed = sum(w_i * (p_i - p_(i-1))) / D
+mean_inertial_speed = sum(w_i * dt_i * I_mid_i) / D
+
+estimated_speed = I_end + mean_visual_speed - mean_inertial_speed
+```
+
+This is a time-weighted mean, not a confidence weight. The visual numerator is
+computed directly from position increments: `dt_i * (delta_p / dt_i)` cancels
+algebraically, so the mean needs no division by each potentially tiny `dt_i`.
+Both means divide only by the same total weighted duration `D`. With fixed `dt`,
+this reduces to the current algorithm. Acceleration integration still has no
+fade factor.
+
+Window and fade lengths must be measured in seconds. If the left window boundary
+cuts an interval, integrate and weight only its overlapping duration, with the
+corresponding interpolated position increment. Large intervals crossing fade
+corners need subdivision or integration of the fade rather than treating the
+whole interval as a single midpoint sample. Reject non-increasing timestamps;
+do not replace zero duration with an arbitrary epsilon. At startup with `D=0`,
+retain the initialized velocity until a usable interval exists.
+
+Cumulative bias learning must also use actual `dt_i` in `normal += dt_i*M_i.T*M_i`
+and `rhs += M_i.T*(a_raw_i*dt_i - delta_v_i)`. The new bias remains available only
+to the next sample. If IMU and visual observations have different timestamps,
+align their integration intervals before applying these same-window formulas.
 
 ## Verification
 

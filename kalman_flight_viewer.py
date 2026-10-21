@@ -663,7 +663,8 @@ class FlightViewer:
                  export_follows_input=False, plotjuggler_path=None):
         import matplotlib.pyplot as plt
         from matplotlib.ticker import MaxNLocator, ScalarFormatter
-        from matplotlib.widgets import Button, Slider, TextBox
+        from matplotlib.widgets import Button, Slider
+        from viewer_widgets import ResponsiveTextBox
 
         self.plt = plt
         self.result, self.cfg, self.window = result, cfg, window
@@ -705,8 +706,9 @@ class FlightViewer:
             row, col = divmod(number, 5)
             left = 0.065 + 0.148 * col
             self.fig.text(left, 0.89 - row * 0.09, label, fontsize=10)
-            widget = TextBox(self.fig.add_axes([left, 0.842 - row * 0.09, 0.128, 0.035]),
-                             '', initial=f'{value:g}')
+            widget = ResponsiveTextBox(
+                self.fig.add_axes([left, 0.842 - row * 0.09, 0.128, 0.035]),
+                '', initial=f'{value:g}')
             self.fields[key] = widget
             widget.on_text_change(self.parameters_edited)
         self.apply_button = Button(self.fig.add_axes([0.815, 0.84, 0.16, 0.045]),
@@ -815,14 +817,7 @@ class FlightViewer:
             center = 0.5 * (lo + hi)
             # Headroom keeps lines clear of the legend.
             ax.set_ylim(center - 0.65 * span, center + 0.95 * span)
-        mode = 'Paused' if self.paused else 'Playing'
-        if index == len(result['time']) - 1:
-            mode = 'End'
-        self.status.set_text(
-            f'{mode}   {self.playback_speed:g}x    t={right:.2f} / {self.duration:.2f} s    '
-            f'height={result["height"][index]:.2f} m    '
-            + self.status_details(index))
-        self.button.label.set_text('Play' if self.paused else 'Pause')
+        self.update_playback_status()
         # Updating the display must not trigger the seek callback or extra draws.
         self.slider.eventson = False
         self.slider.drawon = False
@@ -831,15 +826,36 @@ class FlightViewer:
         self.slider.drawon = True
         self.fig.canvas.draw_idle()
 
+    def update_playback_status(self):
+        if self.result is None:
+            self.status.set_text('No CSV loaded')
+        else:
+            index = min(int((self.current_time + 1e-9) / self.cfg.dt),
+                        len(self.result['time']) - 1)
+            mode = 'Paused' if self.paused else 'Playing'
+            if index == len(self.result['time']) - 1:
+                mode = 'End'
+            self.status.set_text(
+                f'{mode}   {self.playback_speed:g}x    '
+                f't={self.result["time"][index]:.2f} / {self.duration:.2f} s    '
+                f'height={self.result["height"][index]:.2f} m    '
+                + self.status_details(index))
+        self.button.label.set_text('Play' if self.paused else 'Pause')
+
     def parameters_edited(self, _text):
-        # Editing is cheap; only Apply triggers computation and disk writes.
+        # Keep plots and the slider untouched while typing, including when
+        # already paused. Only Apply triggers computation and disk writes.
+        from viewer_widgets import redraw_controls
+        old_bounds = [artist.get_window_extent().frozen()
+                      for artist in (self.status, self.message)]
         self.paused = True
         self.message.set_color('#555555')
         self.message.set_text('Parameters edited. Click Apply + export to recalculate and save.'
                               if self.result is not None else
                               'Parameters will be applied when you open or drop a CSV.')
         if hasattr(self, 'button'):
-            self.draw(force=True)
+            self.update_playback_status()
+            redraw_controls(self.fig, [self.status, self.message, self.button.ax], old_bounds)
 
     def config_from_fields(self):
         values = {}
