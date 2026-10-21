@@ -71,6 +71,37 @@ assumed zero. Height is not used by this algorithm.
 | `lead` | 1 s | Forward-position horizon; does not affect velocity or bias fitting |
 | `quaternion_direction` | `BodyToNed` | Explicit quaternion convention |
 
+Window fades and forward time can be changed during streaming, without reset:
+
+```cpp
+estimator.setFades(3.0, 6.0, 3.0); // fade_in, flat, fade_out, seconds
+estimator.setForwardTime(0.7);     // forward_time / Parameters::lead, seconds
+
+auto result = estimator.update(acceleration_ned, quaternion, visual_position, dt);
+```
+
+`setFades()` takes effect on the next successful `update()`. It preserves
+elapsed time, learned body bias, its fit accumulators, and available history.
+The velocity can change when weights change. To keep that change from being
+mistaken for acceleration, the bias fit re-evaluates the previous timestamp
+with the new window before differencing velocity and its bias response.
+The public `state()` retains the previous estimate until the next update.
+Repeated setters with unchanged fade values are a no-op and can be called
+each measurement.
+
+If the window grows beyond retained history, its actual `window_span_s` grows
+as new data arrives; `window_complete` stays false until the requested duration
+is available. Previously discarded samples are not recreated or zero-padded.
+Shrinking the window applies on the next update and discards expired intervals.
+
+`setForwardTime()` immediately recomputes `state().forward_position` using the
+current scaled position and velocity. It changes no velocity, bias, time, or
+history. Previously returned `Estimate` copies remain unchanged. Both setters
+validate input before committing; invalid values or arithmetic overflow leave
+the current settings/state intact. Fade values and forward time must be finite
+and nonnegative; the sum of fade/flat durations must be positive. Synchronize
+setters and `update()` with the same mutex if used from different threads.
+
 `reset()` clears history and restores configured initial bias/velocity.
 `reset(new_parameters)` changes configuration and starts a new history.
 Replay all measurements to reproduce the Python UI's Apply behavior.

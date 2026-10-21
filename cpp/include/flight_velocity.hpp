@@ -89,8 +89,36 @@ public:
     bool initialized() const noexcept { return initialized_; }
     std::size_t historySize() const noexcept { return history_.size(); }
 
-    // Configuration changes deliberately start a new history. Replaying is
-    // required to compare a whole flight under different parameters.
+    // Applies on the NEXT update, preserving bias, time and retained history.
+    // Growing the window uses available intervals until enough new data arrives.
+    // Repeated calls with unchanged values are a no-op (safe to call each frame).
+    void setFades(double fade_in, double flat, double fade_out) {
+        auto p = parameters_;
+        p.fade_in = fade_in; p.flat = flat; p.fade_out = fade_out;
+        validate(p);
+        if (p.fade_in == parameters_.fade_in && p.flat == parameters_.flat &&
+            p.fade_out == parameters_.fade_out) return;
+        parameters_ = p;
+        window_changed_ = true;
+    }
+
+    // forward_time is Parameters::lead, in seconds. Immediately updates the
+    // published forward position; velocity, bias and window history are intact.
+    void setForwardTime(double forward_time) {
+        auto p = parameters_;
+        p.lead = forward_time;
+        validate(p);
+        Vec2 forward = state_.forward_position;
+        if (initialized_) for (int j = 0; j < 2; ++j)
+            forward[j] = state_.measured_position[j]+forward_time*state_.velocity[j];
+        finite(forward);
+        parameters_ = p;
+        state_.forward_position = forward;
+    }
+
+    // Full configuration/reset starts a new flight. Use the setters above to
+    // change window/forward time without discarding state. Replay is required
+    // to compare a whole flight under different parameters.
     void reset(const Parameters& parameters) {
         validate(parameters);
         parameters_ = parameters;
@@ -100,6 +128,7 @@ public:
         history_.clear();
         time_ = 0;
         initialized_ = false;
+        window_changed_ = false;
         state_ = Estimate{};
         state_.velocity = parameters_.initial_velocity;
         state_.bias_body = state_.bias_body_used = parameters_.initial_bias_body;
@@ -134,17 +163,27 @@ public:
             finish(next, m);
             state_ = next;
             initialized_ = true;
+            window_changed_ = false;
             return state_;
         }
 
+        Estimate previous = state_;
+        if (window_changed_ && !history_.empty()) {
+            // Evaluate the previous timestamp under the NEW window, with the
+            // SAME bias that was used at that timestamp. The public state is
+            // retained until this update succeeds. A configuration-induced
+            // speed/C jump must not become acceleration or bias information.
+            const auto previous_left = windowLeft(time_);
+            windowStatus(previous, previous_left, time_);
+            average(previous, previous_left, time_);
+            finite(previous.velocity);
+            for (const auto& row : previous.bias_response) finite(row);
+        }
         const long double time = time_ + input.dt;
         if (!std::isfinite(time) || time <= time_)
             throw std::invalid_argument("Elapsed time is outside representable range");
         next.time_s = static_cast<double>(time);
         next.dt_s = input.dt;
-        const long double left = std::max(0.0L, time-parameters_.windowSeconds());
-        next.window_span_s = static_cast<double>(time-left);
-        next.window_complete = time + 1e-12L*parameters_.windowSeconds() >= parameters_.windowSeconds();
         Vec2 displacement{};
         for (int j = 0; j < 2; ++j) {
             displacement[j] = next.measured_position[j]-state_.measured_position[j];
@@ -152,9 +191,11 @@ public:
         }
         finite(displacement);
         history_.push_back({time, input.dt, input.acceleration_ned, displacement, m});
+        const auto left = windowLeft(time);
+        windowStatus(next, left, time);
         try {
             average(next, left, time);
-            if (parameters_.learn_bias) learn(next, m);
+            if (parameters_.learn_bias) learn(next, m, previous);
             finish(next, m);
         } catch (...) {
             history_.pop_back();
@@ -163,6 +204,7 @@ public:
         while (!history_.empty() && history_.front().end <= left) history_.pop_front();
         time_ = time;
         state_ = next;
+        window_changed_ = false;
         return state_;
     }
 
@@ -178,6 +220,19 @@ private:
     std::deque<Interval> history_;
     long double time_ = 0;
     bool initialized_ = false;
+    bool window_changed_ = false;
+
+    long double windowLeft(long double time) const {
+        long double left = std::max(0.0L, time-parameters_.windowSeconds());
+        if (!history_.empty())
+            left = std::max(left, history_.front().end-history_.front().dt);
+        return left;
+    }
+    void windowStatus(Estimate& s, long double left, long double time) const {
+        const long double span = time-left;
+        s.window_span_s = static_cast<double>(span);
+        s.window_complete = span + 1e-12L*parameters_.windowSeconds() >= parameters_.windowSeconds();
+    }
 
     static Vec2 multiply(const Mat2& a, const Vec2& b) {
         return {a[0][0]*b[0]+a[0][1]*b[1], a[1][0]*b[0]+a[1][1]*b[1]};
@@ -245,16 +300,16 @@ private:
         }
     }
 
-    void learn(Estimate& s, const Mat2& m) const {
+    void learn(Estimate& s, const Mat2& m, const Estimate& previous) const {
         Mat2 h{};
         const auto response_now = multiply(s.bias_response, s.bias_body_used);
-        const auto response_prev = multiply(state_.bias_response, state_.bias_body_used);
+        const auto response_prev = multiply(previous.bias_response, previous.bias_body_used);
         Vec2 residual{};
         for (int j = 0; j < 2; ++j) {
-            residual[j] = s.raw_acceleration[j]*s.dt_s-(s.velocity[j]-state_.velocity[j])
+            residual[j] = s.raw_acceleration[j]*s.dt_s-(s.velocity[j]-previous.velocity[j])
                           -response_now[j]+response_prev[j];
             for (int k = 0; k < 2; ++k)
-                h[j][k] = m[j][k]-(s.bias_response[j][k]-state_.bias_response[j][k])/s.dt_s;
+                h[j][k] = m[j][k]-(s.bias_response[j][k]-previous.bias_response[j][k])/s.dt_s;
         }
         double information_dt = s.dt_s, residual_weight = 1;
         if (parameters_.bias_memory > 0) {

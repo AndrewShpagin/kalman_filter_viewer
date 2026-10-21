@@ -163,12 +163,137 @@ void changingBias() {
     close(a.bias_body[0], .35, .012); close(a.bias_body[1], .2, .012);
     require(std::hypot(b.bias_body[0]-.35, b.bias_body[1]-.2) > .12, "Regression does not expose stale bias");
 }
+
+void dynamicSettings() {
+    fv::Parameters p;
+    p.fade_in = 1; p.flat = 2; p.fade_out = 1;
+    p.initial_velocity = {2, -1};
+    fv::FlightVelocityEstimator f(p);
+    f.setForwardTime(.5); // also valid before initialization
+    f.setFades(1, 2, 1);
+    fv::Vec2 pos{};
+    f.update({}, {}, pos, 0);
+    for (int i = 0; i < 64; ++i) {
+        pos[0] += .25; pos[1] -= .125;
+        f.update({}, {}, pos, .125);
+    }
+    const auto before = f.state();
+    const auto count = f.historySize();
+    f.setForwardTime(2);
+    close(f.state().forward_position[0], pos[0]+4);
+    close(f.state().forward_position[1], pos[1]-2);
+    require(f.state().velocity == before.velocity && f.state().bias_body == before.bias_body &&
+            f.state().bias_normal == before.bias_normal && f.historySize() == count,
+            "Forward time changed the estimator");
+    f.setForwardTime(0);
+    require(f.state().forward_position == f.state().measured_position, "Zero lead is not current vision");
+
+    f.setFades(2, 4, 2); // history contains only 4 seconds, not the entire flight
+    close(f.state().time_s, before.time_s);
+    require(f.state().velocity == before.velocity && f.historySize() == count, "Setter discarded state");
+    for (int i = 1; i <= 32; ++i) {
+        pos[0] += .25; pos[1] -= .125;
+        const auto s = f.update({}, {}, pos, .125);
+        close(s.window_span_s, 4+i*.125);
+        require(s.window_complete == (i == 32), "Growing window reports missing data as complete");
+        close(s.velocity[0], 2); close(s.velocity[1], -1);
+        close(s.bias_body[0], 0); close(s.bias_body[1], 0);
+    }
+    f.setFades(.5, 1, .5);
+    pos[0] += .25; pos[1] -= .125;
+    const auto s = f.update({}, {}, pos, .125);
+    close(s.window_span_s, 2);
+    require(s.window_complete && f.historySize() == 16, "Shrinking window did not trim history");
+
+    // Failed setters and updates must preserve a pending fade change.
+    f.setFades(1, 1, 1);
+    auto copy = f;
+    rejects([&] { f.setFades(-1, 1, 1); });
+    rejects([&] { f.setFades(0, 0, 0); });
+    rejects([&] { f.setFades(1e308, 1e308, 0); });
+    rejects([&] { f.setForwardTime(-1); });
+    rejects([&] { f.setForwardTime(std::numeric_limits<double>::quiet_NaN()); });
+    rejects([&] { f.setForwardTime(1e308); }); // finite parameter, overflowing output
+    rejects([&] { f.update({1e308, 0}, {}, pos, 10); });
+    require(f.historySize() == copy.historySize(), "Failed pending update changed history");
+    pos[0] += .25; pos[1] -= .125;
+    const auto actual = f.update({}, {}, pos, .125);
+    const auto expected = copy.update({}, {}, pos, .125);
+    require(actual.velocity == expected.velocity && actual.bias_normal == expected.bias_normal &&
+            actual.forward_position == expected.forward_position &&
+            f.parameters().lead == copy.parameters().lead, "Failed setter/update altered pending state");
+
+    // Re-sending identical parameters each frame must reproduce the same fit.
+    copy = f;
+    for (int i = 0; i < 40; ++i) {
+        f.setFades(1, 1, 1); f.setForwardTime(0);
+        pos[0] += .25; pos[1] -= .125;
+        const auto a = f.update({.02, -.03}, {}, pos, .125);
+        const auto b = copy.update({.02, -.03}, {}, pos, .125);
+        require(a.velocity == b.velocity && a.bias_body == b.bias_body && a.bias_normal == b.bias_normal,
+                "Unchanged setters changed the fit");
+    }
+}
+
+void windowChangesDoNotCreateBiasInformation() {
+    fv::Parameters p;
+    p.fade_in = 2; p.flat = 4; p.fade_out = 2;
+    fv::FlightVelocityEstimator f(p);
+    f.update({.3, -.2}, {}, {}, 0);
+    for (int i = 0; i < 200; ++i) f.update({.3, -.2}, {}, {}, .125);
+    const double decay = std::exp(-.125/p.bias_memory);
+    const double information_dt = -p.bias_memory*std::expm1(-.125/p.bias_memory);
+    // Both a duration change and a shape-only change alter C. Without rebasing
+    // the previous window, (C_now-C_previous)/dt manufactures huge information.
+    for (const fv::Vec2 edges : {fv::Vec2{1, 1}, fv::Vec2{.5, 3.5}}) {
+        const auto previous = f.state();
+        f.setFades(edges[0], edges[0] == 1 ? 2 : 0, edges[1]);
+        const auto s = f.update({.3, -.2}, {}, {}, .125);
+        close(s.bias_normal[0], previous.bias_normal[0]*decay+information_dt, 1e-10);
+        close(s.bias_normal[2], previous.bias_normal[2]*decay+information_dt, 1e-10);
+        close(s.bias_rhs[0], previous.bias_rhs[0]*decay+information_dt*.3, 1e-10);
+        close(s.bias_body[0], .3); close(s.bias_body[1], -.2);
+        close(s.velocity[0], 0); close(s.velocity[1], 0);
+    }
+}
+
+void dynamicWindowMotion() {
+    fv::Parameters p;
+    p.initial_velocity = {1, -.5}; p.initial_bias_body = {.3, -.2};
+    p.fade_in = 1; p.flat = 2; p.fade_out = 1;
+    fv::FlightVelocityEstimator f(p);
+    fv::Vec2 pos{}, velocity = p.initial_velocity;
+    f.update({}, {}, pos, 0);
+    for (int i = 1; i <= 500; ++i) {
+        const double t = i*.125, dt = .125;
+        if (i%50 == 0) {
+            const double edge = (i/50)%2 ? 2 : 1;
+            f.setFades(edge, 2*edge, edge);
+            f.setForwardTime((i/50)%3*.5);
+        }
+        const auto q = attitude(.2*std::sin(t), .15*std::cos(.7*t), .37*t);
+        const auto r = fv::rotationMatrix(q);
+        const fv::Vec2 acceleration{.3*std::sin(.5*t), .2*std::cos(.3*t)};
+        for (int j = 0; j < 2; ++j) {
+            pos[j] += velocity[j]*dt+.5*acceleration[j]*dt*dt;
+            velocity[j] += acceleration[j]*dt;
+        }
+        const auto s = f.update({acceleration[0]+r[0][0]*.3-r[0][1]*.2,
+                                 acceleration[1]+r[1][0]*.3-r[1][1]*.2}, q, pos, dt);
+        for (int j = 0; j < 2; ++j) {
+            close(s.velocity[j], velocity[j], 1e-9);
+            close(s.bias_body[j], p.initial_bias_body[j], 1e-9);
+            close(s.forward_position[j], pos[j]+f.parameters().lead*velocity[j], 1e-9);
+        }
+    }
+}
 } // namespace
 
 int main() {
     try {
         close(velocityHeaderOdr(), 4);
         weightedAndClipped(); analyticMotion(); biasAndRotation(); invalidAndRollback(); changingBias();
+        dynamicSettings(); windowChangesDoNotCreateBiasInformation(); dynamicWindowMotion();
         std::cout << "PASS velocity: weighted variable dt, clipped windows, motion, startup, rotating bias, reset and rollback\n";
         return 0;
     } catch (const std::exception& e) {
