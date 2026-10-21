@@ -2,6 +2,9 @@
 
 This Python experiment estimates horizontal velocity from NED acceleration, anchors its mean to visual motion over a past window, and learns accelerometer bias in body axes from the resulting velocity. It does not run a Kalman filter or subtract a fitted linear velocity trend.
 
+A [standalone C++17 streaming class and CSV runner](cpp/VELOCITY.md) implements
+the same algorithm, including startup bias trust, and supports variable `dt`.
+
 ## Run
 
 Use the repository's existing dependencies and keep `velocity_flight_viewer.py`, `kalman_flight_viewer.py` and `viewer_widgets.py` together. The new script imports the shared CSV/attitude helpers and desktop controls.

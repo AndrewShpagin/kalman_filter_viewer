@@ -1,5 +1,8 @@
 # C++ Kalman filter
 
+For the newer experimental windowed velocity algorithm, use
+[`FlightVelocityEstimator` and `velocity_filter_csv`](VELOCITY.md).
+
 `include/flight_kalman.hpp` is a standalone, header-only C++17 implementation of
 the Python viewer's horizontal filter and external body-bias estimator. It uses
 only the standard library; Eigen and Python are not needed to build or run it.
