@@ -241,23 +241,45 @@ def check_attitude(data: np.ndarray, cfg: Config) -> Attitude:
 
 
 class BodyBiasEstimator:
-    """Cumulative external least squares for body bx/by, with body bz fixed to 0."""
-    def __init__(self):
+    """Cumulative body bx/by fit; optional gradual trust in the initial estimate.
+
+    warmup_seconds floors each eigenvalue of the accumulated normal matrix.
+    For identity attitude this is a linear confidence ramp min(t / warmup, 1).
+    Zero retains the original unregularized fit used by the Kalman viewer.
+    """
+    def __init__(self, initial_bias=(0.0, 0.0), warmup_seconds=0.0):
+        self.initial_bias = np.array(initial_bias, dtype=float)
+        if self.initial_bias.shape != (2,) or not np.isfinite(self.initial_bias).all():
+            raise ValueError('Initial body bias must contain two finite values.')
+        if not math.isfinite(warmup_seconds) or warmup_seconds < 0:
+            raise ValueError('Bias warmup must be finite and >= 0.')
+        self.warmup_seconds = warmup_seconds
         self.normal = np.zeros((2, 2))
         self.rhs = np.zeros(2)
-        self.bias = np.zeros(2)
+        self.bias = self.initial_bias.copy()
 
     def update(self, m, raw_acc_ned, delta_velocity_ned, dt):
         residual = raw_acc_ned * dt - delta_velocity_ned
+        return self.update_residual(m, residual, dt)
+
+    def update_residual(self, m, residual, dt):
+        """Accumulate residual = dt * m * bias; no residual/dt division."""
         self.normal += dt * (m.T @ m)
         self.rhs += m.T @ residual
         # Preserve the old estimate in unobservable directions instead of
         # creating a huge bias when the vehicle is near a 90-degree tilt.
         eigenvalues, vectors = np.linalg.eigh(self.normal)
-        observable = eigenvalues > max(float(eigenvalues[-1]) * 1e-8, 1e-12)
-        coordinates = vectors.T @ self.bias
         rhs_coordinates = vectors.T @ self.rhs
-        coordinates[observable] = rhs_coordinates[observable] / eigenvalues[observable]
+        if self.warmup_seconds > 0:
+            # Damp the departure from the configured initial bias, not the
+            # previous damped result. Never first divide by a tiny eigenvalue.
+            initial = vectors.T @ self.initial_bias
+            coordinates = initial + (rhs_coordinates - eigenvalues * initial) / np.maximum(
+                eigenvalues, self.warmup_seconds)
+        else:
+            observable = eigenvalues > max(float(eigenvalues[-1]) * 1e-8, 1e-12)
+            coordinates = vectors.T @ self.bias
+            coordinates[observable] = rhs_coordinates[observable] / eigenvalues[observable]
         self.bias = vectors @ coordinates
         return self.bias.copy()
 

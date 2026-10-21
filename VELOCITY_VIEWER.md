@@ -35,6 +35,7 @@ The default visible plot width is 10 s. This is independent of the 18 s estimati
 | Sample step | 0.05 s | Fixed interval; CSV timestamps do not set the time base |
 | Plot window | 10 s | Visible time span only |
 | Initial body bias X/Y | 0 m/s² | Starting estimates in body axes |
+| Bias warmup | 6 s | Minimum information time before fully trusting a learned body-bias direction; 0 disables the startup ramp |
 | Learn body bias | Enabled | Disable to hold the entered body biases fixed |
 
 **Apply + export** recomputes the whole flight from row zero using the edited settings, saves the CSV, and pauses at the current time. Editing fields does not change the active result until Apply, Open CSV, or Open in PlotJuggler. Reapplying a coordinate scale always starts from the original positions. Invalid parameters or a failed export retain the previously computed result.
@@ -102,6 +103,7 @@ Additional parameters and diagnostics:
 | `weight_sum` | Sum of interval fade weights **before** normalization; dimensionless, not a confidence score |
 | `learn_bias` | 1 learns body bias; 0 holds the entered initial bias fixed |
 | `bias_x0`, `bias_y0` | Initial body bias, m/s² |
+| `bias_warmup` | Minimum information time for the body-bias solve, seconds |
 | `vx0`, `vy0` | Assumed initial NED speed, m/s |
 | `integral_acc_raw_x/y` | Integral of raw NED acceleration since row zero, without bias subtraction, m/s |
 | `quat_x_normalized_input`, `quat_y_normalized_input`, `quat_z_normalized_input`, `quat_w_normalized_input` | Unit-length input quaternion, dimensionless; retains the input direction convention |
@@ -109,7 +111,7 @@ Additional parameters and diagnostics:
 | `yaw_quat_deg` | Yaw from the selected body-to-NED quaternion rotation, degrees |
 | `yaw_error_deg` | `yaw_quat_deg - yaw_csv_deg`, wrapped to [-180, 180) degrees |
 | `bias_fit_normal_xx`, `bias_fit_normal_xy`, `bias_fit_normal_yy` | Symmetric 2×2 cumulative body-bias fit matrix, seconds |
-| `bias_fit_rhs_x/y` | Right-hand side of that fit, m/s; `normal * bias_body = rhs` in observable directions |
+| `bias_fit_rhs_x/y` | Right-hand side of the raw data fit, m/s; startup trust damping is applied when solving it |
 
 Settings are repeated on every row for reproducibility. There are no Kalman
 covariances or gains in this export. Row zero initializes the result; integration
@@ -169,16 +171,67 @@ estimated_speed_i = I_i + offset_i
 
 The fade weights apply to the **means**, not to the physical `a * dt` increments. Only the integration constant is adjusted. This preserves acceleration dynamics; it is different from the earlier experiment that removed a linear trend from integrated acceleration. The lead is used only to produce `forward_position`; it does not feed velocity normalization or bias learning.
 
-After obtaining this sample's velocity, update the next body bias:
+After obtaining this sample's velocity, update the next body bias. The speed
+comes from a faded past window, so its error response to a bias is not simply
+the current attitude. Let `B_j` be the integral of `M_j` from the current
+window's left boundary. Using the same interval-midpoint fade weights as speed:
+
+```text
+C_i = B_end - weighted_mean((B_(j-1) + B_j) / 2)
+```
+
+For exact visual data and a constant true body bias, this gives
+`estimated_speed_i = true_speed_i + C_i*(true_bias - bias_used_i)`.
+Consequently, the residual used to learn bias must account both for the window
+response and for the different bias estimates used at the two adjacent steps:
 
 ```text
 delta_v = estimated_speed_i - estimated_speed_(i-1)       # both in NED
-normal += dt * transpose(M_i) * M_i
-rhs    += transpose(M_i) * (a_raw_i * dt - delta_v)
-b_i     = solve(normal, rhs)
+H_i = M_i - (C_i - C_(i-1)) / dt
+r_i = a_raw_i*dt - delta_v - C_i*bias_used_i + C_(i-1)*bias_used_(i-1)
+normal += dt * transpose(H_i) * H_i
+rhs    += transpose(H_i) * r_i
+b_i     = solve_with_startup_trust(normal, rhs, initial_body_bias, bias_warmup)
 ```
 
-Accumulate over the whole flight. Preserve the previous estimate in unobservable body directions, using the existing eigenvalue check. For a fixed identity attitude this reduces to `(integral(a_raw) - (v_i-v_0)) / elapsed_time`.
+Here `H_i` is a bias observation matrix, not an orthogonal rotation matrix.
+Initialize `C_0=0`. The correction keeps changes caused by updating the bias
+from being interpreted as physical acceleration; it also accounts for the
+window delay during body rotation. Simply damping the previous residual fit
+could hide the startup spike but fail to converge during sustained rotation.
+
+Accumulate over the whole flight. The normal matrix and right-hand side in the
+CSV contain these cumulative observations, without any artificial time added.
+
+At startup, the first velocity update may correct an incorrect assumed initial
+speed or follow visual noise. Dividing that correction by only 0.05 s used to
+produce a large false accelerometer bias, which was fed back into the following
+velocity update. A fading visual mean does not protect a one-interval window:
+its sole weight cancels when the mean is normalized.
+
+Use a minimum information time `T = bias_warmup` (default 6 s). If
+`normal = U * diag(lambda) * U.T`, solve for the departure from the configured
+initial body bias `b0`:
+
+```text
+b_i = b0 + U * ((U.T * (rhs - normal*b0)) / max(lambda, T))
+```
+
+The maximum and division are componentwise. This implements a linear trust ramp
+`min(lambda/T, 1)` in each body direction without first dividing by a tiny
+eigenvalue. Weakly observed directions remain close to the initial bias. The
+information time is not necessarily the wall-clock time: the window and body
+rotation affect how much information each interval contributes.
+
+Row zero is exactly the configured initial bias, zero by default. After a
+direction accumulates at least `T` seconds of information, its solution is the
+ordinary cumulative fit; there is no permanent attenuation of the result.
+The estimate need not grow monotonically: it responds to the actual residuals.
+This startup setting is independent of the visual fade and display windows.
+`--bias-warmup 0` disables only the trust ramp, retaining the corrected window
+response and the observable-eigenvalue check; it can again amplify startup noise.
+With `--fixed-bias`, the configured initial biases are retained throughout and
+warmup has no effect. The Kalman viewer keeps its previous default behavior.
 
 The new `b_i` is used at sample `i+1`. There is no same-sample iteration or use of future velocity. Differencing NED velocities before transporting the residual avoids the rotating-frame derivative term introduced by subtracting velocities expressed in different body frames.
 
@@ -224,10 +277,12 @@ whole interval as a single midpoint sample. Reject non-increasing timestamps;
 do not replace zero duration with an arbitrary epsilon. At startup with `D=0`,
 retain the initialized velocity until a usable interval exists.
 
-Cumulative bias learning must also use actual `dt_i` in `normal += dt_i*M_i.T*M_i`
-and `rhs += M_i.T*(a_raw_i*dt_i - delta_v_i)`. The new bias remains available only
-to the next sample. If IMU and visual observations have different timestamps,
-align their integration intervals before applying these same-window formulas.
+Cumulative bias learning must also use actual `dt_i` in `H_i`, the acceleration
+increment and `normal += dt_i*H_i.T*H_i`. Compute `C_i` with the same time-weighted
+mean used for speed, then accumulate `rhs += H_i.T*r_i` without dividing the
+residual by `dt_i`. The new bias remains available only to the next sample. If
+IMU and visual observations have different timestamps, align their integration
+intervals before applying these same-window formulas.
 
 ## Verification
 
@@ -235,4 +290,4 @@ align their integration intervals before applying these same-window formulas.
 python -m unittest discover -s tests -v
 ```
 
-Tests include known motion with changing acceleration and full attitude, body-bias recovery during rotation, constant NED velocity during rotation, causal prefix consistency, the fixed-attitude integral identity, short-log startup, asymmetric/rectangular windows, CSV export, GUI recalculation, drag/drop dispatch, input protection, and PlotJuggler launch wiring. Existing Kalman-viewer tests run alongside them.
+Tests include known motion with changing acceleration and full attitude, body-bias recovery during rotation from zero and incorrect initial biases, constant NED velocity during rotation, causal prefix consistency, bias recovery during accelerated motion, suppression of a first-frame visual-speed correction in bias learning, warmup with unequal elapsed-time steps and weakly observed body directions, short-log startup, asymmetric/rectangular windows, CSV export, GUI recalculation, drag/drop dispatch, input protection, and PlotJuggler launch wiring. Existing Kalman-viewer tests run alongside them.

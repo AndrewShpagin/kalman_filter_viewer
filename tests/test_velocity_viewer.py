@@ -68,18 +68,58 @@ class VelocityModelTests(unittest.TestCase):
     def test_learns_stationary_body_bias_while_rotating(self):
         bias = np.array([0.3, -0.2])
         data, _ = flight(np.zeros((4000, 2)), body_bias=bias, rotating=True)
-        out = viewer.estimate_velocity(data, config())
-        np.testing.assert_allclose(out['bias_body'][-1], bias, atol=0.005)
-        self.assertLess(np.max(np.abs(out['velocity'][-400:])), 0.02)
+        for initial in ((0., 0.), (-0.5, 0.4)):
+            out = viewer.estimate_velocity(data, config(bias_x0=initial[0], bias_y0=initial[1]))
+            np.testing.assert_allclose(out['bias_body'][-1], bias, atol=1e-10)
+            self.assertLess(np.max(np.abs(out['velocity'][-400:])), 1e-10)
 
-    def test_feedback_is_next_sample_and_identity_matches_integral_formula(self):
+    def test_feedback_is_next_sample_and_learns_bias_during_accelerated_motion(self):
         t = np.arange(900) * 0.05
         acceleration = np.column_stack((np.sin(t/4), np.cos(t/7)))
         data, _ = flight(acceleration, initial_velocity=(1., -2.), body_bias=(0.15, -0.1))
-        out = viewer.estimate_velocity(data, config(vx0=1., vy0=-2.))
-        np.testing.assert_array_equal(out['bias_body_used'][1:], out['bias_body'][:-1])
-        expected = (out['integral_raw'][1:] - out['velocity'][1:] + [1., -2.]) / out['time'][1:, None]
-        np.testing.assert_allclose(out['bias_body'][1:], expected, atol=2e-12)
+        for warmup in (0., 6.):
+            out = viewer.estimate_velocity(data, config(vx0=1., vy0=-2., bias_warmup=warmup))
+            np.testing.assert_array_equal(out['bias_body_used'][1:], out['bias_body'][:-1])
+            np.testing.assert_allclose(out['bias_body'][-1], [.15, -.1], atol=2e-12)
+
+    def test_first_visual_speed_correction_cannot_create_large_startup_bias(self):
+        # A ~4 cm visual change in 50 ms, as in the reported log, must not be
+        # interpreted as a 17-19 m/s² accelerometer bias on the first update.
+        data, _ = flight(np.zeros((100, 2)))
+        data[1:, :2] = [-0.04389, -0.04606]
+        data[1, 3:5] = [-0.14639, 0.12965]
+        unprotected = viewer.estimate_velocity(data, config(bias_warmup=0.))
+        out = viewer.estimate_velocity(data, config())
+        np.testing.assert_array_equal(out['bias_body'][0], [0., 0.])
+        self.assertGreater(np.min(np.abs(unprotected['bias_body'][1])), 17.)
+        self.assertLess(np.max(np.abs(out['bias_body'])), 0.08)
+        # The first visual-speed estimate is unchanged; the correction is to
+        # bias learning, not clipping or hiding the measured coordinate change.
+        np.testing.assert_array_equal(out['velocity'][1], unprotected['velocity'][1])
+
+    def test_bias_trust_ramps_with_elapsed_time_including_unequal_steps(self):
+        initial = np.array([0.04, -0.02])
+        true_bias = np.array([0.3, -0.2])
+        acceleration = np.array([0.8, -0.6])
+        fit = shared.BodyBiasEstimator(initial, warmup_seconds=2.)
+        elapsed = 0.
+        for dt in (0.005, 0.05, 0.3, 0.645, 1., 2.):
+            elapsed += dt
+            value = fit.update(np.eye(2), acceleration + true_bias, acceleration*dt, dt)
+            expected = initial + min(elapsed/2., 1.) * (true_bias-initial)
+            np.testing.assert_allclose(value, expected, atol=1e-14)
+        # After enough information, the initial prior no longer attenuates bias.
+        np.testing.assert_allclose(fit.bias, true_bias, atol=1e-14)
+
+    def test_weakly_observed_body_direction_stays_close_to_initial_bias(self):
+        initial = np.array([0.1, -0.2])
+        fit = shared.BodyBiasEstimator(initial, warmup_seconds=18.)
+        # Pitch near 90 degrees: body X has almost no horizontal projection.
+        m = np.diag([1e-7, 1.])
+        for _ in range(100):
+            fit.update(m, np.array([0.5, 0.2]), np.zeros(2), .05)
+        self.assertLess(abs(fit.bias[0] - initial[0]), 1e-6)
+        self.assertLess(abs(fit.bias[1] - initial[1]), .12)
 
     def test_future_rows_cannot_change_past_estimates(self):
         t = np.arange(600) * 0.05
@@ -111,7 +151,8 @@ class VelocityModelTests(unittest.TestCase):
 
     def test_rejects_invalid_parameters(self):
         for changes in ({'dt': 0}, {'fade_in': -1}, {'coord_scale': 0},
-                        {'lead': float('nan')}, {'fade_in': 0, 'flat': 0, 'fade_out': 0}):
+                        {'lead': float('nan')}, {'bias_warmup': -1},
+                        {'bias_warmup': float('inf')}, {'fade_in': 0, 'flat': 0, 'fade_out': 0}):
             with self.assertRaises(ValueError):
                 config(**changes).validate()
 
@@ -142,6 +183,7 @@ class VelocityUITests(unittest.TestCase):
         v.fields['dt'].set_val('0.1')
         v.fields['lead'].set_val('0.5')
         v.fields['view_window'].set_val('20')
+        v.fields['bias_warmup'].set_val('6')
         self.assertTrue(v.apply_parameters())
         self.assertAlmostEqual(v.duration, 2.9)
         self.assertAlmostEqual(v.slider.valmax, 2.9)
@@ -154,6 +196,7 @@ class VelocityUITests(unittest.TestCase):
         self.assertAlmostEqual(float(rows[-1]['estimated_speed_x']), float(rows[-1]['niacc.x']))
         self.assertIn('mean_visual_speed_x', rows[-1])
         self.assertIn('bias_body_used_x', rows[-1])
+        self.assertEqual(float(rows[-1]['bias_warmup']), 6.)
         original = v.result
         previous_csv = v.export_path.read_bytes()
         v.fields['dt'].set_val('0')

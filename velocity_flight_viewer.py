@@ -5,7 +5,7 @@ Run:    python velocity_flight_viewer.py [flight.csv]
 Export: python velocity_flight_viewer.py flight.csv --no-gui
 
 Uses the same CSV reader, quaternion checks, desktop replay, drag/drop and
-PlotJuggler integration as kalman_flight_viewer.py (keep both files together).
+PlotJuggler integration as kalman_flight_viewer.py (also keep viewer_widgets.py).
 No Kalman filter is used here. Positions are vis_x/y in NED, acceleration is
 acc.x/y or acc_x/y in NED, before subtraction of this estimator's own bias.
 Time is row index * --dt (default 0.05 s), independent of CSV timestamps.
@@ -21,17 +21,28 @@ For each sample i:
         v_i = I_i - weighted_mean(I_mid) + weighted_mean(v_visual).
      Weights do NOT attenuate a*dt. Only an additive velocity offset is fitted;
      no linear detrending and no extra position smoother are applied.
-  5. AFTER computing v_i, accumulate the next body-bias estimate:
-        normal += dt * M_i.T @ M_i
-        rhs    += M_i.T @ (a_raw_i * dt - (v_i - v_(i-1)))
-        b_next  = solve(normal, rhs).
+  5. AFTER computing v_i, accumulate the next body-bias estimate. Account for
+     the known velocity response C_i to a constant BODY bias over its window:
+        H_i = M_i - (C_i - C_(i-1)) / dt
+        residual = a_raw_i*dt - (v_i-v_(i-1))
+                   - C_i*b_used_i + C_(i-1)*b_used_(i-1)
+        normal += dt * H_i.T @ H_i
+        rhs    += H_i.T @ residual
+        b_next  = a gradually trusted solve of normal * b = rhs.
+     Floor normal-matrix eigenvalues at --bias-warmup seconds (default 6).
+     Blend from the configured initial body bias until each direction has
+     enough accumulated information; 0 disables the startup trust ramp.
      Thus new bias first affects the NEXT velocity update. There is no
      same-sample fixed-point iteration and no future velocity in bias fitting.
   6. Plot/export p_forward_i = p_visual_i + lead_seconds * v_i (default 1 s).
 
 Bias accumulation covers the whole flight, not the moving plot/window.
-Body Z bias is assumed zero. For a fixed identity rotation, bias reduces to
-(integral(a_raw) - (v_i-v_0)) / elapsed_time. NED velocity increments must be
+Body Z bias is assumed zero. The minimum information time prevents a first
+visual-speed correction from being divided by almost zero accumulated time
+and immediately fed back as a huge acceleration bias. The response correction
+prevents changing bias from being mistaken for real acceleration, and keeps
+learning aligned with the window's averaging even while the drone rotates.
+NED velocity increments must be
 differenced BEFORE rotating; body velocity differences add a rotation term.
 
 Startup: row 0 uses --vx0/--vy0 and does not integrate. Before a full window
@@ -77,6 +88,7 @@ class VelocityConfig:
     view_window: float = 10.0
     bias_x0: float = 0.0
     bias_y0: float = 0.0
+    bias_warmup: float = 6.0
     vx0: float = 0.0
     vy0: float = 0.0
     learn_bias: bool = True
@@ -92,7 +104,7 @@ class VelocityConfig:
             value = getattr(self, name)
             if not math.isfinite(value) or value <= 0:
                 raise ValueError(f'{name}: must be finite and > 0.')
-        for name in ('fade_in', 'flat', 'fade_out', 'lead'):
+        for name in ('fade_in', 'flat', 'fade_out', 'lead', 'bias_warmup'):
             value = getattr(self, name)
             if not math.isfinite(value) or value < 0:
                 raise ValueError(f'{name}: must be finite and >= 0.')
@@ -164,13 +176,12 @@ def estimate_velocity(data: np.ndarray, cfg: VelocityConfig,
                 'bias', 'bias_used', 'bias_rhs'):
         out[key] = np.zeros((n, 2))
     for name in ('dt', 'fade_in', 'flat', 'fade_out', 'lead', 'coord_scale',
-                 'bias_x0', 'bias_y0', 'vx0', 'vy0', 'learn_bias'):
+                 'bias_x0', 'bias_y0', 'bias_warmup', 'vx0', 'vy0', 'learn_bias'):
         out[name] = np.full(n, float(getattr(cfg, name)))
     out['velocity'][0] = cfg.vx0, cfg.vy0
     out['mean_visual_velocity'][0] = out['velocity'][0]
     out['normalization_offset'][0] = out['velocity'][0]
-    bias_fit = BodyBiasEstimator()
-    bias_fit.bias[:] = cfg.bias_x0, cfg.bias_y0
+    bias_fit = BodyBiasEstimator((cfg.bias_x0, cfg.bias_y0), cfg.bias_warmup)
     out['bias_body'][0] = out['bias_body_used'][0] = bias_fit.bias
     out['bias'][0] = out['bias_used'][0] = matrices[0] @ bias_fit.bias
     out['corrected_acceleration'][0] = raw_acc[0] - out['bias_used'][0]
@@ -179,6 +190,8 @@ def estimate_velocity(data: np.ndarray, cfg: VelocityConfig,
     max_intervals = n - 1 if cfg.fit_window >= t[-1] else int(math.ceil(cfg.fit_window / dt))
     full_ages = (np.arange(max_intervals, 0, -1) - 0.5) * dt
     full_weights = interval_weights(full_ages, cfg.fit_window, cfg)
+    response_previous = np.zeros((2, 2))
+    bias_used_previous = bias_fit.bias.copy()
     for i in range(1, n):
         b = bias_fit.bias.copy()
         m = matrices[i]
@@ -211,11 +224,21 @@ def estimate_velocity(data: np.ndarray, cfg: VelocityConfig,
         out['normalization_offset'][i] = offset
         out['velocity'][i] = integrated[-1] + offset
 
+        # v_i = v_true_i + C_i @ (b_true - b_used_i), for exact visual data
+        # and a constant body bias. C_i uses the SAME window and fade as speed.
+        rotation_midpoints = 0.5 * (r_local[:-1] + r_local[1:])
+        response = r_local[-1] - np.einsum('i,ijk->jk', weights, rotation_midpoints)
         # Current velocity completes this update; the resulting new bias is only
-        # consumed by sample i+1. Difference NED velocities before transporting.
+        # consumed by sample i+1. Account for the window response and for using
+        # different bias estimates on the two adjacent velocity outputs.
         if cfg.learn_bias:
             delta_v = out['velocity'][i] - out['velocity'][i - 1]
-            bias_fit.update(m, raw_acc[i], delta_v, dt)
+            effective_projection = m - (response - response_previous) / dt
+            residual = (raw_acc[i] * dt - delta_v - response @ b
+                        + response_previous @ bias_used_previous)
+            bias_fit.update_residual(effective_projection, residual, dt)
+        response_previous = response
+        bias_used_previous = b
         out['bias_body'][i] = bias_fit.bias
         out['bias'][i] = m @ bias_fit.bias
         normal = bias_fit.normal
@@ -236,7 +259,7 @@ def export_velocity(path: Path, result: dict[str, np.ndarray]) -> None:
     columns = [result['time'], result['height']]
     for key in ('dt', 'fade_in', 'flat', 'fade_out', 'lead', 'coord_scale',
                 'window_span_s', 'window_complete', 'weight_sum', 'learn_bias',
-                'bias_x0', 'bias_y0', 'vx0', 'vy0'):
+                'bias_x0', 'bias_y0', 'bias_warmup', 'vx0', 'vy0'):
         names.append(key)
         columns.append(result[key])
     for key, prefix in (
@@ -292,7 +315,7 @@ class VelocityViewer(FlightViewer):
     def __init__(self, *args, **kwargs):
         from matplotlib.widgets import CheckButtons
         super().__init__(*args, **kwargs)
-        self.bias_toggle = CheckButtons(self.fig.add_axes([0.657, 0.752, 0.128, 0.035]),
+        self.bias_toggle = CheckButtons(self.fig.add_axes([0.815, 0.735, 0.16, 0.035]),
                                        ['Learn body bias'], [self.cfg.learn_bias])
         self.bias_toggle.on_clicked(self.parameters_edited)
 
@@ -307,6 +330,7 @@ class VelocityViewer(FlightViewer):
             ('view_window', 'Plot window (s)', cfg.view_window),
             ('bias_x0', 'Initial body bias X', cfg.bias_x0),
             ('bias_y0', 'Initial body bias Y', cfg.bias_y0),
+            ('bias_warmup', 'Bias warmup (s)', cfg.bias_warmup),
         )
 
     def plot_groups(self, axis):
@@ -321,7 +345,8 @@ class VelocityViewer(FlightViewer):
         c = self.cfg
         return (f'Active: window {c.fade_in:g} + {c.flat:g} + {c.fade_out:g} = {c.fit_window:g} s; '
                 f'lead={c.lead:g} s; scale={c.coord_scale:g}; dt={c.dt:g} s; '
-                f'view={self.window:g} s; body bias: {"learning" if c.learn_bias else "fixed"}.')
+                f'view={self.window:g} s; body bias: {"learning" if c.learn_bias else "fixed"}; '
+                f'bias warmup={c.bias_warmup:g} s.')
 
     def status_details(self, index):
         r = self.result
@@ -365,6 +390,7 @@ def parse_args(argv=None):
         ('coord-scale', 1., 'Multiplier on original vis_x/y'),
         ('bias-x0', 0., 'Initial body X accelerometer bias, m/s^2'),
         ('bias-y0', 0., 'Initial body Y accelerometer bias, m/s^2'),
+        ('bias-warmup', 6., 'Minimum accumulated information time for body bias, seconds; 0 = immediate fit'),
         ('vx0', 0., 'Initial NED X velocity, m/s'),
         ('vy0', 0., 'Initial NED Y velocity, m/s'),
     ):
