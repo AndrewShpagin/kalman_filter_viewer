@@ -26,17 +26,21 @@ For each sample i:
         H_i = M_i - (C_i - C_(i-1)) / dt
         residual = a_raw_i*dt - (v_i-v_(i-1))
                    - C_i*b_used_i + C_(i-1)*b_used_(i-1)
-        normal += dt * H_i.T @ H_i
-        rhs    += H_i.T @ residual
+        Decay old normal/rhs with --bias-memory (60 s; 0 = whole flight),
+        then add the interval observation with its elapsed-time weight.
         b_next  = a gradually trusted solve of normal * b = rhs.
-     Floor normal-matrix eigenvalues at --bias-warmup seconds (default 6).
+     Start the normal-matrix eigenvalue floor at --bias-warmup seconds (6).
+     With finite memory, decay this startup floor together with old data.
      Blend from the configured initial body bias until each direction has
      enough accumulated information; 0 disables the startup trust ramp.
      Thus new bias first affects the NEXT velocity update. There is no
      same-sample fixed-point iteration and no future velocity in bias fitting.
   6. Plot/export p_forward_i = p_visual_i + lead_seconds * v_i (default 1 s).
 
-Bias accumulation covers the whole flight, not the moving plot/window.
+Bias observations have exponential memory, independent of the moving plot/window.
+Default 60 s keeps the fit responsive to changing effective bias; 0 restores
+the whole-flight fit. This is necessary when vibration or attitude errors make
+the effective accelerometer offset vary during flight.
 Body Z bias is assumed zero. The minimum information time prevents a first
 visual-speed correction from being divided by almost zero accumulated time
 and immediately fed back as a huge acceleration bias. The response correction
@@ -89,6 +93,7 @@ class VelocityConfig:
     bias_x0: float = 0.0
     bias_y0: float = 0.0
     bias_warmup: float = 6.0
+    bias_memory: float = 60.0
     vx0: float = 0.0
     vy0: float = 0.0
     learn_bias: bool = True
@@ -104,7 +109,7 @@ class VelocityConfig:
             value = getattr(self, name)
             if not math.isfinite(value) or value <= 0:
                 raise ValueError(f'{name}: must be finite and > 0.')
-        for name in ('fade_in', 'flat', 'fade_out', 'lead', 'bias_warmup'):
+        for name in ('fade_in', 'flat', 'fade_out', 'lead', 'bias_warmup', 'bias_memory'):
             value = getattr(self, name)
             if not math.isfinite(value) or value < 0:
                 raise ValueError(f'{name}: must be finite and >= 0.')
@@ -176,12 +181,12 @@ def estimate_velocity(data: np.ndarray, cfg: VelocityConfig,
                 'bias', 'bias_used', 'bias_rhs'):
         out[key] = np.zeros((n, 2))
     for name in ('dt', 'fade_in', 'flat', 'fade_out', 'lead', 'coord_scale',
-                 'bias_x0', 'bias_y0', 'bias_warmup', 'vx0', 'vy0', 'learn_bias'):
+                 'bias_x0', 'bias_y0', 'bias_warmup', 'bias_memory', 'vx0', 'vy0', 'learn_bias'):
         out[name] = np.full(n, float(getattr(cfg, name)))
     out['velocity'][0] = cfg.vx0, cfg.vy0
     out['mean_visual_velocity'][0] = out['velocity'][0]
     out['normalization_offset'][0] = out['velocity'][0]
-    bias_fit = BodyBiasEstimator((cfg.bias_x0, cfg.bias_y0), cfg.bias_warmup)
+    bias_fit = BodyBiasEstimator((cfg.bias_x0, cfg.bias_y0), cfg.bias_warmup, cfg.bias_memory)
     out['bias_body'][0] = out['bias_body_used'][0] = bias_fit.bias
     out['bias'][0] = out['bias_used'][0] = matrices[0] @ bias_fit.bias
     out['corrected_acceleration'][0] = raw_acc[0] - out['bias_used'][0]
@@ -259,7 +264,7 @@ def export_velocity(path: Path, result: dict[str, np.ndarray]) -> None:
     columns = [result['time'], result['height']]
     for key in ('dt', 'fade_in', 'flat', 'fade_out', 'lead', 'coord_scale',
                 'window_span_s', 'window_complete', 'weight_sum', 'learn_bias',
-                'bias_x0', 'bias_y0', 'bias_warmup', 'vx0', 'vy0'):
+                'bias_x0', 'bias_y0', 'bias_warmup', 'bias_memory', 'vx0', 'vy0'):
         names.append(key)
         columns.append(result[key])
     for key, prefix in (
@@ -331,6 +336,7 @@ class VelocityViewer(FlightViewer):
             ('bias_x0', 'Initial body bias X', cfg.bias_x0),
             ('bias_y0', 'Initial body bias Y', cfg.bias_y0),
             ('bias_warmup', 'Bias warmup (s)', cfg.bias_warmup),
+            ('bias_memory', 'Bias memory (s; 0=all)', cfg.bias_memory),
         )
 
     def plot_groups(self, axis):
@@ -346,7 +352,7 @@ class VelocityViewer(FlightViewer):
         return (f'Active: window {c.fade_in:g} + {c.flat:g} + {c.fade_out:g} = {c.fit_window:g} s; '
                 f'lead={c.lead:g} s; scale={c.coord_scale:g}; dt={c.dt:g} s; '
                 f'view={self.window:g} s; body bias: {"learning" if c.learn_bias else "fixed"}; '
-                f'bias warmup={c.bias_warmup:g} s.')
+                f'bias warmup={c.bias_warmup:g} s; bias memory={c.bias_memory:g} s (0=all).')
 
     def status_details(self, index):
         r = self.result
@@ -391,6 +397,7 @@ def parse_args(argv=None):
         ('bias-x0', 0., 'Initial body X accelerometer bias, m/s^2'),
         ('bias-y0', 0., 'Initial body Y accelerometer bias, m/s^2'),
         ('bias-warmup', 6., 'Minimum accumulated information time for body bias, seconds; 0 = immediate fit'),
+        ('bias-memory', 60., 'Exponential memory of body bias, seconds; 0 = whole flight'),
         ('vx0', 0., 'Initial NED X velocity, m/s'),
         ('vy0', 0., 'Initial NED Y velocity, m/s'),
     ):

@@ -32,7 +32,7 @@ def variable_reference(data, cfg, dt):
     out['window_complete'] = (t + 1e-12*cfg.fit_window >= cfg.fit_window).astype(float)
     out['integral_raw'] = np.cumsum(data[:, 3:5]*dt[:, None], axis=0)
     out['visual_velocity'][1:] = np.diff(out['measured_position'], axis=0)/dt[1:, None]
-    bias = py.BodyBiasEstimator((cfg.bias_x0, cfg.bias_y0), cfg.bias_warmup)
+    bias = py.BodyBiasEstimator((cfg.bias_x0, cfg.bias_y0), cfg.bias_warmup, cfg.bias_memory)
     responses = np.zeros((len(data), 2, 2))
     durations = np.zeros(len(data))
     for i in range(1, len(data)):
@@ -81,6 +81,7 @@ def compare(exe, source, work, cfg, flags=(), intervals=None):
     args = [str(exe), str(source), '--export', str(output)]
     for option, field in (('fade-in', 'fade_in'), ('flat', 'flat'), ('fade-out', 'fade_out'),
                           ('lead', 'lead'), ('coord-scale', 'coord_scale'), ('bias-warmup', 'bias_warmup'),
+                          ('bias-memory', 'bias_memory'),
                           ('bias-x0', 'bias_x0'), ('bias-y0', 'bias_y0'), ('vx0', 'vx0'), ('vy0', 'vy0'),
                           ('quat-direction', 'quaternion_direction'), ('yaw-unit', 'yaw_unit')):
         args += ['--'+option, str(getattr(cfg, field))]
@@ -121,7 +122,7 @@ def compare(exe, source, work, cfg, flags=(), intervals=None):
 def rejections(exe, source, work):
     output = work/'protected.csv'
     output.write_text('previous valid output', encoding='utf-8')
-    for flags in (['--dt', '0'], ['--fade-in', '-1'], ['--bias-warmup', '-1'],
+    for flags in (['--dt', '0'], ['--fade-in', '-1'], ['--bias-warmup', '-1'], ['--bias-memory', '-1'],
                   ['--fade-in', '0', '--flat', '0', '--fade-out', '0'],
                   ['--time-column', 'timestamp', '--dt', '.05'],
                   ['--time-column', 'pos_sigma'], ['--dt-column', 'acc_y']):
@@ -153,6 +154,7 @@ def main():
                                bias_x0=-.1, bias_y0=.07, bias_warmup=.6, vx0=.7, vy0=-.4, lead=.7)
         compare(exe, source, work, cfg)
         compare(exe, source, work, replace(cfg, bias_warmup=0))
+        compare(exe, source, work, replace(cfg, bias_memory=0))
         compare(exe, source, work, replace(cfg, learn_bias=False))
         compare(exe, source, work, cfg, ['--dt-column', 'elapsed'], dt)
         compare(exe, source, work, cfg, ['--time-column', 'timestamp', '--time-scale', '.001'], dt)

@@ -121,6 +121,41 @@ class VelocityModelTests(unittest.TestCase):
         self.assertLess(abs(fit.bias[0] - initial[0]), 1e-6)
         self.assertLess(abs(fit.bias[1] - initial[1]), .12)
 
+    def test_bias_memory_tracks_a_changed_offset_after_long_initial_history(self):
+        # Stationary vision, rotating body, changing bias, large zero-mean noise.
+        # A whole-flight fit leaves a persistent signed acceleration/speed error.
+        count = 8000
+        data, _ = flight(np.zeros((count, 2)), rotating=True)
+        t = np.arange(count)*.05
+        rotation, _ = shared.quaternion_matrices(data[:, 5:9])
+        bias = np.where((t < 160)[:, None], [.05, -.05], [.35, .2])
+        noise = np.column_stack((.8*np.sin(9*t), .7*np.cos(11*t)))
+        data[:, 3:5] = np.einsum('nij,nj->ni', rotation[:, :2, :2], bias+noise)
+        fixed = viewer.estimate_velocity(data, config())
+        cumulative = viewer.estimate_velocity(data, config(bias_memory=0))
+        np.testing.assert_allclose(fixed['bias_body'][-1], bias[-1], atol=.012)
+        self.assertGreater(np.linalg.norm(cumulative['bias_body'][-1]-bias[-1]), .12)
+        # The fit is still causal, starts at zero, and applies the new bias later.
+        np.testing.assert_array_equal(fixed['bias_body'][0], [0., 0.])
+        np.testing.assert_array_equal(fixed['bias_body_used'][1:], fixed['bias_body'][:-1])
+
+    def test_bias_memory_uses_seconds_and_exact_interval_weights(self):
+        # Identical observations over equal elapsed time must give equal
+        # information even when dt varies by orders of magnitude.
+        reference = shared.BodyBiasEstimator(warmup_seconds=6., memory_seconds=60.)
+        irregular = shared.BodyBiasEstimator(warmup_seconds=6., memory_seconds=60.)
+        m = np.array([[.8, -.2], [.1, .9]])
+        bias = np.array([.3, -.2])
+        for _ in range(1000):
+            reference.update_residual(m, (m@bias)*.01, .01)
+        for dt in (.000001, .07, 2.4, 7.529999):
+            irregular.update_residual(m, (m@bias)*dt, dt)
+        np.testing.assert_allclose(irregular.normal, reference.normal, atol=1e-12)
+        np.testing.assert_allclose(irregular.rhs, reference.rhs, atol=1e-12)
+        np.testing.assert_allclose(irregular.bias, reference.bias, atol=1e-12)
+        expected = -60*np.expm1(-10/60)*(m.T@m)
+        np.testing.assert_allclose(irregular.normal, expected, atol=1e-12)
+
     def test_future_rows_cannot_change_past_estimates(self):
         t = np.arange(600) * 0.05
         data, _ = flight(np.column_stack((np.sin(t), np.cos(t))), body_bias=(0.1, 0.2), rotating=True)
@@ -151,7 +186,8 @@ class VelocityModelTests(unittest.TestCase):
 
     def test_rejects_invalid_parameters(self):
         for changes in ({'dt': 0}, {'fade_in': -1}, {'coord_scale': 0},
-                        {'lead': float('nan')}, {'bias_warmup': -1},
+                        {'lead': float('nan')}, {'bias_warmup': -1}, {'bias_memory': -1},
+                        {'bias_memory': float('inf')},
                         {'bias_warmup': float('inf')}, {'fade_in': 0, 'flat': 0, 'fade_out': 0}):
             with self.assertRaises(ValueError):
                 config(**changes).validate()
@@ -184,6 +220,7 @@ class VelocityUITests(unittest.TestCase):
         v.fields['lead'].set_val('0.5')
         v.fields['view_window'].set_val('20')
         v.fields['bias_warmup'].set_val('6')
+        v.fields['bias_memory'].set_val('45')
         self.assertTrue(v.apply_parameters())
         self.assertAlmostEqual(v.duration, 2.9)
         self.assertAlmostEqual(v.slider.valmax, 2.9)
@@ -197,6 +234,7 @@ class VelocityUITests(unittest.TestCase):
         self.assertIn('mean_visual_speed_x', rows[-1])
         self.assertIn('bias_body_used_x', rows[-1])
         self.assertEqual(float(rows[-1]['bias_warmup']), 6.)
+        self.assertEqual(float(rows[-1]['bias_memory']), 45.)
         original = v.result
         previous_csv = v.export_path.read_bytes()
         v.fields['dt'].set_val('0')

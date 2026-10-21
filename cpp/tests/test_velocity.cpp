@@ -86,7 +86,7 @@ void biasAndRotation() {
     auto s = f.update({.3, -.2}, {}, {}, 0);
     close(s.bias_body[0], 0);
     s = f.update({.3, -.2}, {}, {}, .05);
-    close(s.bias_body[0], .3*.05/4/6);
+    close(s.bias_body[0], .3*(-60*std::expm1(-.05/60))/4/(6*std::exp(-.05/60)));
     close(s.bias_body_used[0], 0); // newly fitted bias only affects the next update
     const double initial = s.bias_body[0];
     s = f.update({.3, -.2}, {}, {}, .05);
@@ -143,12 +143,32 @@ void invalidAndRollback() {
     rejects([&] { f.reset(p); });
     close(f.state().time_s, a.time_s);
 }
+
+void changingBias() {
+    fv::Parameters p;
+    fv::FlightVelocityEstimator recent(p);
+    p.bias_memory = 0;
+    fv::FlightVelocityEstimator cumulative(p);
+    fv::Estimate a, b;
+    for (int i = 0; i < 8000; ++i) {
+        const double time = i*.05;
+        const fv::Vec2 bias = time < 160 ? fv::Vec2{.05, -.05} : fv::Vec2{.35, .2};
+        const auto q = attitude(.2*std::sin(.23*time), .3*std::cos(.31*time), .37*time);
+        const auto r = fv::rotationMatrix(q);
+        const double bx = bias[0]+.8*std::sin(9*time), by = bias[1]+.7*std::cos(11*time);
+        const fv::Vec2 acc{r[0][0]*bx+r[0][1]*by, r[1][0]*bx+r[1][1]*by};
+        a = recent.update(acc, q, {}, i ? .05 : 0);
+        b = cumulative.update(acc, q, {}, i ? .05 : 0);
+    }
+    close(a.bias_body[0], .35, .012); close(a.bias_body[1], .2, .012);
+    require(std::hypot(b.bias_body[0]-.35, b.bias_body[1]-.2) > .12, "Regression does not expose stale bias");
+}
 } // namespace
 
 int main() {
     try {
         close(velocityHeaderOdr(), 4);
-        weightedAndClipped(); analyticMotion(); biasAndRotation(); invalidAndRollback();
+        weightedAndClipped(); analyticMotion(); biasAndRotation(); invalidAndRollback(); changingBias();
         std::cout << "PASS velocity: weighted variable dt, clipped windows, motion, startup, rotating bias, reset and rollback\n";
         return 0;
     } catch (const std::exception& e) {

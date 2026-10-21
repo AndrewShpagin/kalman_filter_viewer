@@ -21,6 +21,7 @@ void help() {
   --lead SECONDS                Forward position horizon (1)
   --coord-scale FACTOR          Vision position multiplier (1)
   --bias-warmup SECONDS         Minimum bias information time (6; 0 disables)
+  --bias-memory SECONDS         Exponential bias memory (60; 0 = whole flight)
   --bias-x0 VALUE --bias-y0 VALUE  Initial BODY bias, m/s^2 (0,0)
   --vx0 VALUE --vy0 VALUE       Initial NED velocity, m/s (0,0)
   --no-learn-bias               Hold initial body bias fixed
@@ -62,6 +63,7 @@ Options parse(const std::vector<std::string>& args) {
         else if (arg == "--lead") o.parameters.lead = realNumber(value, arg);
         else if (arg == "--coord-scale") o.parameters.coordinate_scale = realNumber(value, arg);
         else if (arg == "--bias-warmup") o.parameters.bias_warmup = realNumber(value, arg);
+        else if (arg == "--bias-memory") o.parameters.bias_memory = realNumber(value, arg);
         else if (arg == "--bias-x0") o.parameters.initial_bias_body[0] = realNumber(value, arg);
         else if (arg == "--bias-y0") o.parameters.initial_bias_body[1] = realNumber(value, arg);
         else if (arg == "--vx0") o.parameters.initial_velocity[0] = realNumber(value, arg);
@@ -101,7 +103,7 @@ void write(const Options& o, const std::vector<Row>& rows,
     out.open(temporary, std::ios::binary);
     out.imbue(std::locale::classic());
     out << std::setprecision(std::numeric_limits<double>::max_digits10);
-    out << "time_s;mheight;dt;fade_in;flat;fade_out;lead;coord_scale;window_span_s;window_complete;weight_sum;learn_bias;bias_x0;bias_y0;bias_warmup;vx0;vy0";
+    out << "time_s;mheight;dt;fade_in;flat;fade_out;lead;coord_scale;window_span_s;window_complete;weight_sum;learn_bias;bias_x0;bias_y0;bias_warmup;bias_memory;vx0;vy0";
     for (const char* prefix : {"vis", "vis_scaled", "estimated_speed", "forward_position", "visual_interval_speed",
                               "mean_visual_speed", "mean_inertial_speed", "window_integral_acc", "velocity_offset",
                               "acc_raw", "acc_used", "integral_acc_raw", "bias_body_used", "bias_body_estimated",
@@ -118,7 +120,7 @@ void write(const Options& o, const std::vector<Row>& rows,
         out << s.time_s << ';' << rows[i].v[2] << ';' << dt << ';' << p.fade_in << ';' << p.flat << ';' << p.fade_out
             << ';' << p.lead << ';' << p.coordinate_scale << ';' << s.window_span_s << ';' << s.window_complete
             << ';' << s.weight_sum << ';' << p.learn_bias << ';' << p.initial_bias_body[0] << ';' << p.initial_bias_body[1]
-            << ';' << p.bias_warmup << ';' << p.initial_velocity[0] << ';' << p.initial_velocity[1];
+            << ';' << p.bias_warmup << ';' << p.bias_memory << ';' << p.initial_velocity[0] << ';' << p.initial_velocity[1];
         fv::Vec2 visual_speed = p.initial_velocity;
         if (i > 0) for (int j = 0; j < 2; ++j) {
             // Diagnostic only: the estimator itself accumulates displacements

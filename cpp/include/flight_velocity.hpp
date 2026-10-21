@@ -50,6 +50,7 @@ struct Parameters {
     double lead = 1;                          // forward_position = scaled vision + lead*v
     double coordinate_scale = 1;
     double bias_warmup = 6;                   // minimum information time, seconds
+    double bias_memory = 60;                  // exponential memory, seconds; 0 = whole flight
     Vec2 initial_velocity{};                 // NED, m/s
     Vec2 initial_bias_body{};                // BODY X/Y, m/s^2
     bool learn_bias = true;
@@ -67,6 +68,7 @@ struct Measurement {
 struct Estimate {
     double time_s = 0, dt_s = 0, window_span_s = 0;
     double weight_sum = 0, weighted_duration_s = 0;
+    double bias_prior_information_s = 0;     // decaying startup floor
     bool window_complete = false;
     Vec2 raw_position{}, measured_position{}, forward_position{}, velocity{};
     Vec2 mean_visual_velocity{}, mean_integrated_velocity{};
@@ -101,6 +103,7 @@ public:
         state_ = Estimate{};
         state_.velocity = parameters_.initial_velocity;
         state_.bias_body = state_.bias_body_used = parameters_.initial_bias_body;
+        state_.bias_prior_information_s = parameters_.bias_warmup;
     }
 
     Estimate update(Vec2 raw_acceleration_ned, Quaternion quaternion,
@@ -184,7 +187,7 @@ private:
     }
     static void finite(const Vec2& v) { for (double x : v) finite(x); }
     static void validate(const Parameters& p) {
-        for (double x : {p.fade_in, p.flat, p.fade_out, p.lead, p.bias_warmup}) {
+        for (double x : {p.fade_in, p.flat, p.fade_out, p.lead, p.bias_warmup, p.bias_memory}) {
             finite(x);
             if (x < 0) throw std::invalid_argument("Durations must be nonnegative");
         }
@@ -253,11 +256,21 @@ private:
             for (int k = 0; k < 2; ++k)
                 h[j][k] = m[j][k]-(s.bias_response[j][k]-state_.bias_response[j][k])/s.dt_s;
         }
+        double information_dt = s.dt_s, residual_weight = 1;
+        if (parameters_.bias_memory > 0) {
+            const double ratio = s.dt_s/parameters_.bias_memory;
+            const double decay = std::exp(-ratio);
+            information_dt = ratio == 0 ? s.dt_s : -parameters_.bias_memory*std::expm1(-ratio);
+            residual_weight = information_dt/s.dt_s;
+            for (double& x : s.bias_normal) x *= decay;
+            for (double& x : s.bias_rhs) x *= decay;
+            s.bias_prior_information_s *= decay;
+        }
         for (int j = 0; j < 2; ++j) {
-            s.bias_normal[0] += s.dt_s*h[j][0]*h[j][0];
-            s.bias_normal[1] += s.dt_s*h[j][0]*h[j][1];
-            s.bias_normal[2] += s.dt_s*h[j][1]*h[j][1];
-            for (int k = 0; k < 2; ++k) s.bias_rhs[k] += h[j][k]*residual[j];
+            s.bias_normal[0] += information_dt*h[j][0]*h[j][0];
+            s.bias_normal[1] += information_dt*h[j][0]*h[j][1];
+            s.bias_normal[2] += information_dt*h[j][1]*h[j][1];
+            for (int k = 0; k < 2; ++k) s.bias_rhs[k] += residual_weight*h[j][k]*residual[j];
         }
         for (double x : s.bias_normal) finite(x);
         finite(s.bias_rhs);
@@ -271,8 +284,9 @@ private:
             const auto b0 = parameters_.initial_bias_body;
             const auto prior = project(b0);
             const auto error = project({s.bias_rhs[0]-a*b0[0]-b*b0[1], s.bias_rhs[1]-b*b0[0]-d*b0[1]});
-            components = {prior[0]+error[0]/std::max(high, parameters_.bias_warmup),
-                          prior[1]+error[1]/std::max(low, parameters_.bias_warmup)};
+            const double floor = std::max(s.bias_prior_information_s, std::max(high*1e-8, 1e-12));
+            components = {prior[0]+error[0]/std::max(high, floor),
+                          prior[1]+error[1]/std::max(low, floor)};
         } else {
             const double threshold = std::max(high*1e-8, 1e-12);
             const auto rhs = project(s.bias_rhs);
@@ -287,7 +301,7 @@ private:
         s.bias_ned = multiply(m, s.bias_body);
         for (int j = 0; j < 2; ++j)
             s.forward_position[j] = s.measured_position[j]+parameters_.lead*s.velocity[j];
-        for (double x : {s.time_s, s.dt_s, s.window_span_s, s.weight_sum, s.weighted_duration_s}) finite(x);
+        for (double x : {s.time_s, s.dt_s, s.window_span_s, s.weight_sum, s.weighted_duration_s, s.bias_prior_information_s}) finite(x);
         for (const auto& v : {s.raw_position, s.measured_position, s.forward_position, s.velocity,
                              s.mean_visual_velocity, s.mean_integrated_velocity, s.window_integral,
                              s.normalization_offset, s.raw_acceleration, s.corrected_acceleration,

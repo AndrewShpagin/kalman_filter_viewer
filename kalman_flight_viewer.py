@@ -241,19 +241,26 @@ def check_attitude(data: np.ndarray, cfg: Config) -> Attitude:
 
 
 class BodyBiasEstimator:
-    """Cumulative body bx/by fit; optional gradual trust in the initial estimate.
+    """Body bx/by fit with optional startup trust and exponential time memory.
 
-    warmup_seconds floors each eigenvalue of the accumulated normal matrix.
-    For identity attitude this is a linear confidence ramp min(t / warmup, 1).
+    warmup_seconds sets the initial information floor. With memory=0 and
+    identity attitude this is a linear confidence ramp min(t / warmup, 1).
+    With finite memory, the startup floor decays along with old observations.
     Zero retains the original unregularized fit used by the Kalman viewer.
+    memory_seconds=0 retains the cumulative fit; positive memory downweights
+    old observations, using exact time weights for a constant interval residual.
     """
-    def __init__(self, initial_bias=(0.0, 0.0), warmup_seconds=0.0):
+    def __init__(self, initial_bias=(0.0, 0.0), warmup_seconds=0.0, memory_seconds=0.0):
         self.initial_bias = np.array(initial_bias, dtype=float)
         if self.initial_bias.shape != (2,) or not np.isfinite(self.initial_bias).all():
             raise ValueError('Initial body bias must contain two finite values.')
         if not math.isfinite(warmup_seconds) or warmup_seconds < 0:
             raise ValueError('Bias warmup must be finite and >= 0.')
         self.warmup_seconds = warmup_seconds
+        if not math.isfinite(memory_seconds) or memory_seconds < 0:
+            raise ValueError('Bias memory must be finite and >= 0.')
+        self.memory_seconds = memory_seconds
+        self.prior_information = warmup_seconds
         self.normal = np.zeros((2, 2))
         self.rhs = np.zeros(2)
         self.bias = self.initial_bias.copy()
@@ -264,8 +271,25 @@ class BodyBiasEstimator:
 
     def update_residual(self, m, residual, dt):
         """Accumulate residual = dt * m * bias; no residual/dt division."""
-        self.normal += dt * (m.T @ m)
-        self.rhs += m.T @ residual
+        if not math.isfinite(dt) or dt <= 0:
+            raise ValueError('Bias observation interval must be finite and > 0.')
+        information_dt, residual_weight = dt, 1.0
+        if self.memory_seconds > 0:
+            ratio = dt / self.memory_seconds
+            decay = math.exp(-ratio)
+            # Integrate exp(-age/tau) over this interval. This gives the same
+            # information for one long observation or many identical short ones.
+            information_dt = (dt if ratio == 0 else
+                              -self.memory_seconds * math.expm1(-ratio))
+            residual_weight = information_dt / dt  # bounded by 1, no noisy derivative
+            self.normal *= decay
+            self.rhs *= decay
+            # The startup prior must fade with the same memory. Otherwise a
+            # direction whose finite-memory information saturates below warmup
+            # is permanently pulled toward the initial (usually zero) bias.
+            self.prior_information *= decay
+        self.normal += information_dt * (m.T @ m)
+        self.rhs += residual_weight * (m.T @ residual)
         # Preserve the old estimate in unobservable directions instead of
         # creating a huge bias when the vehicle is near a 90-degree tilt.
         eigenvalues, vectors = np.linalg.eigh(self.normal)
@@ -274,8 +298,9 @@ class BodyBiasEstimator:
             # Damp the departure from the configured initial bias, not the
             # previous damped result. Never first divide by a tiny eigenvalue.
             initial = vectors.T @ self.initial_bias
+            floor = max(self.prior_information, float(eigenvalues[-1])*1e-8, 1e-12)
             coordinates = initial + (rhs_coordinates - eigenvalues * initial) / np.maximum(
-                eigenvalues, self.warmup_seconds)
+                eigenvalues, floor)
         else:
             observable = eigenvalues > max(float(eigenvalues[-1]) * 1e-8, 1e-12)
             coordinates = vectors.T @ self.bias

@@ -39,13 +39,14 @@ The default visible plot width is 10 s. This is independent of the 18 s estimati
 | Plot window | 10 s | Visible time span only |
 | Initial body bias X/Y | 0 m/s² | Starting estimates in body axes |
 | Bias warmup | 6 s | Minimum information time before fully trusting a learned body-bias direction; 0 disables the startup ramp |
+| Bias memory | 60 s | Exponential age-decay time for bias observations; 0 restores the whole-flight fit |
 | Learn body bias | Enabled | Disable to hold the entered body biases fixed |
 
 **Apply + export** recomputes the whole flight from row zero using the edited settings, saves the CSV, and pauses at the current time. Editing fields does not change the active result until Apply, Open CSV, or Open in PlotJuggler. Reapplying a coordinate scale always starts from the original positions. Invalid parameters or a failed export retain the previously computed result.
 
 Typing, cursor movement and changing field focus repaint only the controls on TkAgg/QtAgg. They do not redraw the eight plots, recalculate estimates or write the CSV, even when replay was already paused. Other backends without partial drawing fall back to a full redraw.
 
-Initial NED speed is zero by default. If the log starts while moving, set `--vx0` and `--vy0` in m/s. These are the assumed starting speed for cumulative bias fitting, not a velocity measurement from a later frame.
+Initial NED speed is zero by default. If the log starts while moving, set `--vx0` and `--vy0` in m/s. These are the assumed starting speed for bias fitting, not a velocity measurement from a later frame.
 
 ## Input and output
 
@@ -107,13 +108,14 @@ Additional parameters and diagnostics:
 | `learn_bias` | 1 learns body bias; 0 holds the entered initial bias fixed |
 | `bias_x0`, `bias_y0` | Initial body bias, m/s² |
 | `bias_warmup` | Minimum information time for the body-bias solve, seconds |
+| `bias_memory` | Exponential memory of bias observations, seconds; 0 means no forgetting |
 | `vx0`, `vy0` | Assumed initial NED speed, m/s |
 | `integral_acc_raw_x/y` | Integral of raw NED acceleration since row zero, without bias subtraction, m/s |
 | `quat_x_normalized_input`, `quat_y_normalized_input`, `quat_z_normalized_input`, `quat_w_normalized_input` | Unit-length input quaternion, dimensionless; retains the input direction convention |
 | `yaw_csv_deg` | Input yaw converted to degrees |
 | `yaw_quat_deg` | Yaw from the selected body-to-NED quaternion rotation, degrees |
 | `yaw_error_deg` | `yaw_quat_deg - yaw_csv_deg`, wrapped to [-180, 180) degrees |
-| `bias_fit_normal_xx`, `bias_fit_normal_xy`, `bias_fit_normal_yy` | Symmetric 2×2 cumulative body-bias fit matrix, seconds |
+| `bias_fit_normal_xx`, `bias_fit_normal_xy`, `bias_fit_normal_yy` | Symmetric 2×2 age-weighted body-bias fit matrix, seconds |
 | `bias_fit_rhs_x/y` | Right-hand side of the raw data fit, m/s; startup trust damping is applied when solving it |
 
 Settings are repeated on every row for reproducibility. There are no Kalman
@@ -197,14 +199,35 @@ rhs    += transpose(H_i) * r_i
 b_i     = solve_with_startup_trust(normal, rhs, initial_body_bias, bias_warmup)
 ```
 
+The accumulation above describes `bias_memory=0`. With positive memory `tau`
+(default 60 s), replace those two accumulation lines by:
+
+```text
+decay = exp(-dt / tau)
+information_dt = tau * (1 - decay)   # computed with -tau*expm1(-dt/tau)
+normal = decay*normal + information_dt * transpose(H_i) * H_i
+rhs    = decay*rhs + (information_dt/dt) * transpose(H_i) * r_i
+```
+
+The bounded `information_dt/dt` scales the integrated residual; no noisy
+acceleration estimate is formed by dividing the residual by a tiny interval.
+These are exact exponential time weights for an observation held over `dt`,
+so identical observations carry equal information regardless of subdivision.
+
 Here `H_i` is a bias observation matrix, not an orthogonal rotation matrix.
 Initialize `C_0=0`. The correction keeps changes caused by updating the bias
 from being interpreted as physical acceleration; it also accounts for the
 window delay during body rotation. Simply damping the previous residual fit
 could hide the startup spike but fail to converge during sustained rotation.
 
-Accumulate over the whole flight. The normal matrix and right-hand side in the
-CSV contain these cumulative observations, without any artificial time added.
+The whole-flight fit assumes a constant effective body bias. If vibration,
+temperature, attitude error or other effects change the offset, old observations
+can dominate and leave persistent corrected-acceleration drift. Finite memory
+lets recent observations replace old ones. A 60 s time constant means a sample
+60 s old has weight `exp(-1)`, not that observations older than 60 s are cut off.
+This memory is separate from the 18 s velocity window and the display window.
+`--bias-memory 0` reproduces the previous cumulative mode. The observed offset
+is effective bias relative to vision; the log alone cannot isolate its cause.
 
 At startup, the first velocity update may correct an incorrect assumed initial
 speed or follow visual noise. Dividing that correction by only 0.05 s used to
@@ -212,23 +235,28 @@ produce a large false accelerometer bias, which was fed back into the following
 velocity update. A fading visual mean does not protect a one-interval window:
 its sole weight cancels when the mean is normalized.
 
-Use a minimum information time `T = bias_warmup` (default 6 s). If
+Use a startup information floor `T = bias_warmup` (default 6 s). If
 `normal = U * diag(lambda) * U.T`, solve for the departure from the configured
 initial body bias `b0`:
 
 ```text
-b_i = b0 + U * ((U.T * (rhs - normal*b0)) / max(lambda, T))
+T_prior = T * exp(-elapsed_learning_time / tau)  # positive memory
+# For memory=0, T_prior=T. A numerical observability floor also remains.
+b_i = b0 + U * ((U.T * (rhs - normal*b0)) / max(lambda, T_prior, numerical_floor))
 ```
 
 The maximum and division are componentwise. This implements a linear trust ramp
-`min(lambda/T, 1)` in each body direction without first dividing by a tiny
+`min(lambda/T_prior, 1)` in each body direction without first dividing by a tiny
 eigenvalue. Weakly observed directions remain close to the initial bias. The
 information time is not necessarily the wall-clock time: the window and body
 rotation affect how much information each interval contributes.
 
-Row zero is exactly the configured initial bias, zero by default. After a
-direction accumulates at least `T` seconds of information, its solution is the
-ordinary cumulative fit; there is no permanent attenuation of the result.
+Row zero is exactly the configured initial bias, zero by default. When a
+direction's information exceeds the remaining startup floor, its solution is
+the ordinary age-weighted fit. The initial prior decays together with old data;
+otherwise a rotating body's finite-memory information could saturate below
+`T`, permanently pulling the learned bias toward zero. The numerical floor
+still protects unobservable directions.
 The estimate need not grow monotonically: it responds to the actual residuals.
 This startup setting is independent of the visual fade and display windows.
 `--bias-warmup 0` disables only the trust ramp, retaining the corrected window
@@ -280,10 +308,9 @@ whole interval as a single midpoint sample. Reject non-increasing timestamps;
 do not replace zero duration with an arbitrary epsilon. At startup with `D=0`,
 retain the initialized velocity until a usable interval exists.
 
-Cumulative bias learning must also use actual `dt_i` in `H_i`, the acceleration
-increment and `normal += dt_i*H_i.T*H_i`. Compute `C_i` with the same time-weighted
-mean used for speed, then accumulate `rhs += H_i.T*r_i` without dividing the
-residual by `dt_i`. The new bias remains available only to the next sample. If
+Bias learning must also use actual `dt_i` in `H_i`, the acceleration increment,
+and the decay/information weights above. Compute `C_i` with the same time-weighted
+mean used for speed. The new bias remains available only to the next sample. If
 IMU and visual observations have different timestamps, align their integration
 intervals before applying these same-window formulas.
 

@@ -15,6 +15,7 @@ params.fade_in = 6.0;
 params.flat = 6.0;
 params.fade_out = 6.0;
 params.bias_warmup = 6.0;
+params.bias_memory = 60.0;
 params.coordinate_scale = 1.0;
 params.lead = 1.0;
 flight_velocity::FlightVelocityEstimator estimator(params);
@@ -62,6 +63,7 @@ assumed zero. Height is not used by this algorithm.
 | --- | ---: | --- |
 | `fade_in`, `flat`, `fade_out` | 6, 6, 6 s | Oldest to newest; sum must be positive |
 | `bias_warmup` | 6 s | Minimum information time for full trust per body direction; 0 disables ramp |
+| `bias_memory` | 60 s | Exponential memory of bias observations; 0 restores the whole-flight fit |
 | `initial_bias_body` | `{0, 0}` m/s² | Starting body X/Y bias |
 | `initial_velocity` | `{0, 0}` m/s | Starting NED velocity; set if already moving |
 | `learn_bias` | `true` | `false` holds initial body bias fixed |
@@ -74,8 +76,8 @@ assumed zero. Height is not used by this algorithm.
 Replay all measurements to reproduce the Python UI's Apply behavior.
 There are no Kalman measurement-noise parameters in this algorithm.
 
-Only intervals overlapping the trailing window are retained, while bias-fit
-information accumulates over the whole flight. Work and memory per update are
+Only intervals overlapping the trailing window are retained. Bias-fit
+information has its own exponential memory (60 s by default). Work and memory per update are
 O(samples in window), about 360 intervals at 20 Hz with defaults. The class
 uses `std::deque` and can allocate; it is not an allocation-free hard real-time
 interface. There is no fixed sample-count cap. Synchronize access externally
@@ -125,12 +127,23 @@ and the changing bias used between updates:
 H = R_xy - (C_now - C_previous) / dt
 r = raw_acc*dt - (v_now-v_previous)
     - C_now*b_used_now + C_previous*b_used_previous
-normal += dt * transpose(H) * H
-rhs    += transpose(H) * r
+decay = exp(-dt / bias_memory)
+information_dt = -bias_memory * expm1(-dt / bias_memory)
+normal = decay*normal + information_dt * transpose(H) * H
+rhs    = decay*rhs + (information_dt/dt) * transpose(H) * r
 ```
 
+For `bias_memory=0`, use decay=1 and information_dt=dt (the previous whole-flight
+fit). Positive memory follows a changing effective offset instead of averaging
+all earlier flight conditions forever. Its interval weights account for actual
+elapsed time, including long intervals. It does not fade acceleration integration.
+
 An analytic symmetric 2x2 eigensolve floors each information eigenvalue at
-`bias_warmup`, blending from `initial_bias_body`. Initial bias is zero by default
+`bias_warmup * exp(-elapsed_learning_time / bias_memory)`, plus a small numerical
+observability floor, blending from `initial_bias_body`. With memory=0, the startup
+floor remains `bias_warmup`. Decaying the startup prior avoids permanently
+attenuating bias when a rotating body provides little information per second.
+Initial bias is zero by default
 and trust accumulates gradually. This is not a hard bias or slew-rate limit.
 The newly fitted bias is used on the **next** update.
 
@@ -166,7 +179,8 @@ defaults to **`result_velocity_cpp.csv`** beside the input; use `--export PATH`
 to change it. Input overwriting is refused. Calculation and validation complete
 before atomic output replacement.
 
-The first 63 output columns match the Python velocity export. Six are appended:
+The first 64 output columns match the Python velocity export, including
+`bias_memory`. Six are appended:
 `dt_s` (integrated interval, zero at initialization), `weighted_duration_s`
 (`D` in seconds), and `bias_response_xx/xy/yx/yy`. `weight_sum` remains the
 dimensionless sum of fade weights; it is not the normalizer for unequal
@@ -181,7 +195,7 @@ python cpp/tests/compare_velocity_with_python.py --exe build/bin/velocity_filter
 ```
 
 With fixed steps dividing the window duration (including defaults), comparisons
-call the unmodified Python estimator and check all 63 shared columns. For a
+call the Python estimator and check all 64 shared columns. For a
 non-integer window/step ratio, Python currently retains whole oldest intervals;
 C++ clips the partial interval, so differences are expected. Variable-dt
 comparisons use a separate vectorized NumPy reference with the same clipping.
