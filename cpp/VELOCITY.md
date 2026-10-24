@@ -5,6 +5,11 @@ the algorithm in `velocity_flight_viewer.py`, including the corrected startup
 body-bias learning. Copy this one header into your application. It uses only
 the standard library. The older `FlightKalmanFilter` remains a separate class.
 
+Detailed Ukrainian walkthrough: [VELOCITY_ALGORITHM_UK.md](VELOCITY_ALGORITHM_UK.md).
+It derives the bias equations, explains every processing stage and variable-dt
+weight, and includes an analytic 20–60 FPS phase-response check. The header
+also contains Ukrainian comments beside the implementation.
+
 ## Integration
 
 ```cpp
@@ -62,7 +67,7 @@ assumed zero. Height is not used by this algorithm.
 | Parameter | Default | Meaning |
 | --- | ---: | --- |
 | `fade_in`, `flat`, `fade_out` | 6, 6, 6 s | Oldest to newest; sum must be positive |
-| `bias_warmup` | 6 s | Minimum information time for full trust per body direction; 0 disables ramp |
+| `bias_warmup` | 6 s | Initial information floor per body direction; decays with finite memory; 0 disables ramp |
 | `bias_memory` | 60 s | Exponential memory of bias observations; 0 restores the whole-flight fit |
 | `initial_bias_body` | `{0, 0}` m/s² | Starting body X/Y bias |
 | `initial_velocity` | `{0, 0}` m/s | Starting NED velocity; set if already moving |
