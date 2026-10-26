@@ -23,9 +23,10 @@ params.bias_warmup = 6.0;
 params.bias_memory = 60.0;
 params.coordinate_scale = 1.0;
 params.lead = 1.0;
+params.vision_delay = 0.0; // seconds, relative to IMU; set the measured/assumed delay
 flight_velocity::FlightVelocityEstimator estimator(params);
 
-// Call once per synchronized measurement, in time order.
+// Call once per received measurement bundle, in time order.
 // acceleration_ned: m/s^2, gravity already removed, our bias NOT removed.
 // quaternion: x,y,z,w, body -> NED by default.
 // visual_position: horizontal NED metres; dt_seconds: actual elapsed seconds.
@@ -56,9 +57,9 @@ or arithmetic overflow throws `std::invalid_argument`, leaving state and
 history intact.
 
 Acceleration and attitude at update `i` represent the interval `(i-1, i]`;
-vision is its endpoint position. Align measurements to the same time. Input
-acceleration is translational NED, not body accelerometer specific force.
-The class does not remove gravity or compensate sensor latency. Body X/Y bias
+vision is the position at `time_s - vision_delay`. Acceleration is translational
+NED, not body accelerometer specific force. The class removes the configured
+constant vision/IMU time offset; it does not remove gravity or estimate latency. Body X/Y bias
 is learned internally and rotated using full roll/pitch/yaw. Body-Z bias is
 assumed zero. Height is not used by this algorithm.
 
@@ -73,6 +74,7 @@ assumed zero. Height is not used by this algorithm.
 | `initial_velocity` | `{0, 0}` m/s | Starting NED velocity; set if already moving |
 | `learn_bias` | `true` | `false` holds initial body bias fixed |
 | `coordinate_scale` | 1 | Positive multiplier on visual positions |
+| `vision_delay` | 0 s | Vision age relative to IMU; finite, nonnegative; configure at construction/reset |
 | `lead` | 1 s | Forward-position horizon; does not affect velocity or bias fitting |
 | `quaternion_direction` | `BodyToNed` | Explicit quaternion convention |
 
@@ -112,25 +114,30 @@ setters and `update()` with the same mutex if used from different threads.
 Replay all measurements to reproduce the Python UI's Apply behavior.
 There are no Kalman measurement-noise parameters in this algorithm.
 
-Only intervals overlapping the trailing window are retained. Bias-fit
+Only intervals overlapping `window_seconds + vision_delay` are retained. Bias-fit
 information has its own exponential memory (60 s by default). Work and memory per update are
-O(samples in window), about 360 intervals at 20 Hz with defaults. The class
+O(samples in window + delay), about 360 intervals at 20 Hz with zero-delay defaults.
+For a fixed window/delay and bounded sample rate, memory does not grow with flight duration. The class
 uses `std::deque` and can allocate; it is not an allocation-free hard real-time
 interface. There is no fixed sample-count cap. Synchronize access externally
 if called from multiple threads.
 
 | Output | Meaning |
 | --- | --- |
-| `velocity` | Estimated NED X/Y speed, m/s |
+| `velocity` | Estimated NED X/Y speed **now**, m/s |
+| `delayed_velocity` | Speed at the aligned vision epoch; valid when `alignment_ready` |
+| `prediction_delta_velocity` | Corrected IMU integral from that epoch to now; before alignment, integral from time zero |
+| `vision_time_s`, `alignment_ready` | `time_s - vision_delay`; whether this epoch has reached the available IMU time origin |
+| `bias_fit_dt_s` | Duration admitted to bias learning this update; zero during alignment startup or fixed-bias mode |
 | `raw_position`, `measured_position` | Original and scaled visual positions, m |
 | `forward_position` | Scaled visual position + `lead * velocity`, m |
 | `bias_body_used`, `bias_ned_used` | Bias applied to this velocity update, m/s² |
 | `bias_body`, `bias_ned` | Newly fitted bias, first applied on the next update |
 | `corrected_acceleration` | Current raw NED acceleration minus `bias_ned_used` |
 | `mean_visual_velocity`, `mean_integrated_velocity` | Two duration-weighted means being matched |
-| `window_integral`, `normalization_offset` | Their sum is the output velocity |
+| `window_integral`, `normalization_offset` | Their sum is `delayed_velocity` when aligned |
 | `bias_normal`, `bias_rhs` | Accumulated bias-fit information and right-hand side; not covariance |
-| `bias_response` | 2x2 velocity response `C` to body bias |
+| `bias_response` | 2x2 **delayed** velocity response `C` to body bias |
 | `window_span_s`, `window_complete` | Available window duration and whether the full window exists |
 
 ## Time integration and bias
@@ -141,7 +148,8 @@ For retained interval length `h_j` and midpoint fade weight `w_j`:
 D = sum(w_j * h_j)
 mean_visual   = sum(w_j * displacement_j) / D
 mean_inertial = sum(w_j * h_j * I_mid_j) / D
-velocity     = I_end - mean_inertial + mean_visual
+delayed_velocity = I_end - mean_inertial + mean_visual
+velocity = delayed_velocity + integral(corrected_acc, vision_epoch, now)
 ```
 
 `I` integrates `acceleration_ned - R_xy * previous_body_bias`, **without fade**.
@@ -150,9 +158,11 @@ quaternion. The core accumulates visual displacements directly, avoiding
 per-sample visual division by tiny `dt`. Both means use the same duration
 weights and interval midpoints, matching the Python discrete model.
 
-The oldest interval is clipped to `now - window_seconds`. Its visual displacement
-is interpolated linearly; acceleration and attitude are held constant within
-each input interval. Fades are evaluated at each retained interval's midpoint,
+The window ends at `vision_epoch = now - vision_delay`; its left edge is
+`vision_epoch - window_seconds`, clipped to available history. Two cursors merge
+IMU boundaries with shifted vision boundaries, splitting fractional intervals.
+Vision position is interpolated linearly; acceleration and attitude are held
+constant within each IMU interval. Fades are evaluated at each shared piece's midpoint,
 not integrated continuously. These sampling approximations are less accurate
 for long gaps. Startup uses available intervals only; edge fades can overlap.
 
@@ -160,8 +170,10 @@ After calculating velocity, bias fitting accounts for the window response `C`
 and the changing bias used between updates:
 
 ```
-H = R_xy - (C_now - C_previous) / dt
-r = raw_acc*dt - (v_now-v_previous)
+delta_raw = integral(raw_acc, previous_vision_epoch, vision_epoch)
+delta_M   = integral(R_xy, previous_vision_epoch, vision_epoch)
+H = (delta_M - C_now + C_previous) / dt
+r = delta_raw - (delayed_v_now-delayed_v_previous)
     - C_now*b_used_now + C_previous*b_used_previous
 decay = exp(-dt / bias_memory)
 information_dt = -bias_memory * expm1(-dt / bias_memory)
@@ -215,14 +227,14 @@ defaults to **`result_velocity_cpp.csv`** beside the input; use `--export PATH`
 to change it. Input overwriting is refused. Calculation and validation complete
 before atomic output replacement.
 
-The first 64 output columns match the Python velocity export, including
-`bias_memory`. Six are appended:
-`dt_s` (integrated interval, zero at initialization), `weighted_duration_s`
-(`D` in seconds), and `bias_response_xx/xy/yx/yy`. `weight_sum` remains the
-dimensionless sum of fade weights; it is not the normalizer for unequal
-intervals. With fixed steps, `dt` retains the configured value on every row for
-Python compatibility; in timestamp/dt-column mode it equals `dt_s`. Use
-`time_s` as the PlotJuggler time axis.
+Python and C++ export the same **78 columns**. The old 70 C++ columns retain
+names/order; eight delay diagnostics are appended: `vision_delay`,
+`vision_time_s`, `alignment_ready`, `bias_fit_dt_s`, `delayed_speed_x/y`,
+`prediction_delta_v_x/y`. `dt_s` is zero at initialization;
+`weighted_duration_s` is the mean normalizer. `weight_sum` sums weights over
+shared subintervals and is not comparable across different delays/sample rates.
+With fixed steps `dt` keeps the configured value on every row; in timestamp/dt
+mode it equals `dt_s`. Use `time_s` as the PlotJuggler axis.
 
 ```sh
 python cpp/tests/compare_velocity_with_python.py --exe build/bin/velocity_filter_csv
@@ -230,14 +242,46 @@ python cpp/tests/compare_velocity_with_python.py --exe build/bin/velocity_filter
   --csv flight.csv --time-column timestamp --time-scale 0.001
 ```
 
-With fixed steps dividing the window duration (including defaults), comparisons
-call the Python estimator and check all 64 shared columns. For a
-non-integer window/step ratio, Python currently retains whole oldest intervals;
-C++ clips the partial interval, so differences are expected. Variable-dt
-comparisons use a separate vectorized NumPy reference with the same clipping.
-The Python viewer itself still uses fixed `--dt`, ignoring CSV timestamps.
+Both implementations support fixed or variable time, fractional windows and
+fractional delay. The comparison checks all exported fields. Python now clips
+partial oldest intervals too; older Python releases retained the full interval,
+so fractional-window results can differ slightly even with zero delay.
 
 Core tests cover analytic motion, unequal interval weights, partial windows,
 rotating body bias, inverse quaternions, startup, unobservable directions,
 reset, invalid-update rollback and multiple-translation-unit inclusion.
 Numerical agreement verifies the port, not closed-loop flight stability.
+
+## Constant vision delay
+
+Set `params.vision_delay` before constructing the estimator (or use
+`reset(new_parameters)` and replay). The GUI's **Vision delay (s)** field and
+both runners' `--vision-delay` option use the same convention. Zero is the
+default; there is no automatic delay search. Dynamic `setFades()` and
+`setForwardTime()` still preserve the streaming state; changing delay requires
+reset/replay so differently aligned bias observations are not mixed.
+
+Before `time_s >= vision_delay`, no pre-log IMU samples exist. Keep initial
+body bias, integrate current speed from `initial_velocity` at IMU time zero,
+and export `alignment_ready=0`. Establish the first delayed-speed reference
+once overlap exists. Learn bias only between two available aligned epochs.
+`window_complete` becomes true after `vision_delay + window_seconds` (or later
+when a previously shortened window grows). The new bias first affects the
+next update; prediction to now uses the same old bias as the window.
+
+`forward_position = scaled_vision + lead * velocity_now` is unchanged.
+Vision position itself still belongs to `vision_time_s`; the implementation
+does **not** additionally integrate position to now or silently add the delay
+to `lead`. This is the requested experimental output, not an exact prediction
+of physical position at `now + lead`.
+
+```sh
+velocity_filter_csv flight.csv --time-column timestamp --time-scale .001 \
+  --vision-delay .2 --fade-in 32 --flat 1 --fade-out 1 --lead 1
+```
+
+Here `.2` is an example input, not an inferred delay for a particular flight.
+`test_velocity_delay.cpp` checks a known 237 ms and 2137 ms delay, irregular
+20–60 FPS, rotating BODY bias, startup, dynamic fades, history bounds and
+invalid-update rollback. The analytic test includes an uncompensated control;
+it does not infer the real flight's delay or flight stability.

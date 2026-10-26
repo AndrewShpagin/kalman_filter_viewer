@@ -33,9 +33,10 @@ The default visible plot width is 10 s. This is independent of the 18 s estimati
 | Old-edge fade | 6 s | Weight grows linearly from zero at the oldest edge |
 | Flat part | 6 s | Full weight |
 | Recent-edge fade | 6 s | Weight falls linearly to zero at the newest edge |
+| Vision delay | 0 s | Capture age relative to IMU; aligns history before bias learning, then predicts speed to now |
 | Forward time | 1 s | Lead horizon in `vis + lead * speed`, independent of sample step |
 | Coordinate multiplier | 1 | Applied to original `vis_x/y` before deriving visual speed |
-| Sample step | 0.05 s | Fixed interval; CSV timestamps do not set the time base |
+| Fixed step | 0.05 s | Used only without `--time-column` / `--dt-column` |
 | Plot window | 10 s | Visible time span only |
 | Initial body bias X/Y | 0 m/s² | Starting estimates in body axes |
 | Bias warmup | 6 s | Minimum information time before fully trusting a learned body-bias direction; 0 disables the startup ramp |
@@ -62,7 +63,7 @@ axes. Body Z bias is assumed zero. All means refer to the current past window.
 
 | Columns | Meaning |
 | --- | --- |
-| `time_s`, `dt` | Row-based elapsed time and sample step, seconds; input timestamps are not used |
+| `time_s`, `dt` | Elapsed time and interval, seconds; fixed step by default, actual time with a time/dt column |
 | `mheight` | Input height above ground, metres; logged but not used to weight this velocity estimator |
 | `vis_x/y`, `vis_scaled_x/y` | Original and scaled positions |
 | `estimated_speed_x/y`, `niacc.x/y` | Estimated velocity; the two naming schemes contain identical values |
@@ -70,7 +71,7 @@ axes. Body Z bias is assumed zero. All means refer to the current past window.
 | `visual_interval_speed_x/y` | Visual position difference divided by sample step; row zero contains the assumed initial speed |
 | `mean_visual_speed_x/y` | Weighted visual interval-velocity mean |
 | `mean_inertial_speed_x/y` | Weighted mean of the locally integrated inertial velocity, before offset correction |
-| `window_integral_acc_x/y` | Inertial integral at the current endpoint, starting at zero at the window's left sample boundary |
+| `window_integral_acc_x/y` | Corrected integral at the vision epoch, starting at zero at the clipped left window boundary |
 | `velocity_offset_x/y` | Mean visual speed minus mean inertial speed |
 | `bias_body_used_x/y` | Previous body estimate used for this velocity update |
 | `bias_body_estimated_x/y` | Body bias after the update, available to the next sample |
@@ -87,12 +88,13 @@ For either axis, the exported identities are:
 
 ```text
 velocity_offset = mean_visual_speed - mean_inertial_speed
-estimated_speed = window_integral_acc + velocity_offset
+delayed_speed = window_integral_acc + velocity_offset
+estimated_speed = delayed_speed + prediction_delta_v
 forward_position = vis_scaled + lead * estimated_speed
 ```
 
 `mean_inertial_speed` is the weighted mean over the window, not the velocity
-at the window centre. The integral starts from zero at its left boundary, so
+at the window centre. The window ends at `time_s - vision_delay`. Its integral starts from zero at its left boundary, so
 its absolute value depends on that boundary; `velocity_offset` restores the
 velocity reference. `bias_*_used` is the previous estimate used on this step,
 while `bias_*_estimated` is the newly updated estimate for the following step.
@@ -119,8 +121,7 @@ Additional parameters and diagnostics:
 | `bias_fit_rhs_x/y` | Right-hand side of the raw data fit, m/s; startup trust damping is applied when solving it |
 
 Settings are repeated on every row for reproducibility. There are no Kalman
-covariances or gains in this export. Row zero initializes the result; integration
-and bias learning begin at row one. The first visual-interval speed is the
+covariances or gains in this export. Row zero initializes the result; integration begins at row one; bias learning waits for two aligned vision epochs. The first visual-interval speed is the
 assumed initial speed rather than a measured difference.
 
 ```bash
@@ -139,7 +140,7 @@ python velocity_flight_viewer.py flight.csv --no-gui --window 20 --start 330 --s
 
 **Open in PlotJuggler** applies edited settings, exports, and opens the result using the same executable discovery as the Kalman viewer. Use `time_s` as the time column and `;` as the delimiter if prompted.
 
-## Exact update order
+## Window update order (zero delay; alignment described below)
 
 Let `R_j` map body to NED, and `M_j = R_j[:2, :2]`. Only body X/Y bias is estimated; **body Z bias is fixed to zero**. Roll, pitch and yaw all participate in the projection.
 
@@ -270,49 +271,77 @@ Row zero initializes state without integration or bias learning. During startup 
 
 This is an experiment with coupled velocity and bias estimates, not an independent measurement of accelerometer bias. Visual-motion errors and attitude errors can enter the learned bias. Correct arithmetic and consistent synthetic motion do not establish closed-loop flight stability or accuracy on a real log without ground truth.
 
-## Requirement for the final variable-time implementation
+## Vision delay and actual timestamps
 
-The current CSV experiment uses one fixed `dt` (default 0.05 s). It does **not**
-yet read variable sample timestamps. The eventual streaming implementation must
-use actual elapsed time both in integration and in the two means, rather than
-giving a densely sampled part of the window more influence just because it has
-more samples.
+`vision_delay` is a nonnegative number of seconds relative to the IMU data.
+It is independent of `lead` / Forward time. Apply recomputes the flight from
+row zero; no automatic delay fitting is performed.
 
-For interval `i`, let `dt_i = t_i - t_(i-1) > 0`, and evaluate the same fade
-`w_i` at that interval's time midpoint for both signals. With acceleration held
-constant within each interval, the midpoint approximation is:
+For receipt time `t`, vision belongs to `s = t - vision_delay`. Normalize the
+inertial/visual means on `[s-window, s]`, using historical acceleration and
+quaternion projections for those physical times. Merge IMU and shifted vision
+interval boundaries, including fractional first/last pieces. Fade weights
+are evaluated at shared piece midpoints and both means use `w * duration`.
+Acceleration is never multiplied by fade. Visual position inside an input
+interval is linearly interpolated, which is approximate under acceleration.
+
+The bias fit uses differences of **delayed** velocity and the raw IMU and
+rotation integrals between the same two vision epochs. Its response correction
+is `H = (integral(M dt) - C_now + C_previous) / dt`. The `C` matrices also refer
+to the aligned window. Then use the same previously available body bias to
+integrate from the latest vision epoch to now:
 
 ```text
-I_i = I_(i-1) + (a_raw_i - M_i * previous_body_bias) * dt_i
-I_mid_i = (I_(i-1) + I_i) / 2
-D = sum(w_i * dt_i)
-
-mean_visual_speed = sum(w_i * (p_i - p_(i-1))) / D
-mean_inertial_speed = sum(w_i * dt_i * I_mid_i) / D
-
-estimated_speed = I_end + mean_visual_speed - mean_inertial_speed
+velocity_now = delayed_velocity + integral(a_raw - M*b_used, s, t)
+forward_position = scaled_vision + lead * velocity_now
 ```
 
-This is a time-weighted mean, not a confidence weight. The visual numerator is
-computed directly from position increments: `dt_i * (delta_p / dt_i)` cancels
-algebraically, so the mean needs no division by each potentially tiny `dt_i`.
-Both means divide only by the same total weighted duration `D`. With fixed `dt`,
-this reduces to the current algorithm. Acceleration integration still has no
-fade factor.
+`forward_position` retains this experimental formula. It does not additionally
+advance the visual position to now or add the delay to `lead` automatically.
+Before `s >= 0`, use inertial integration from the configured initial speed at
+IMU time zero, keep initial bias and mark `alignment_ready=0`. Never invent
+pre-log IMU. The first usable delayed speed establishes the reference; bias
+learning needs two aligned epochs. `window_complete` includes this startup.
 
-Window and fade lengths must be measured in seconds. If the left window boundary
-cuts an interval, integrate and weight only its overlapping duration, with the
-corresponding interpolated position increment. Large intervals crossing fade
-corners need subdivision or integration of the fade rather than treating the
-whole interval as a single midpoint sample. Reject non-increasing timestamps;
-do not replace zero duration with an arbitrary epsilon. At startup with `D=0`,
-retain the initialized velocity until a usable interval exists.
+Additional output columns (also exported by C++):
 
-Bias learning must also use actual `dt_i` in `H_i`, the acceleration increment,
-and the decay/information weights above. Compute `C_i` with the same time-weighted
-mean used for speed. The new bias remains available only to the next sample. If
-IMU and visual observations have different timestamps, align their integration
-intervals before applying these same-window formulas.
+| Columns | Meaning |
+| --- | --- |
+| `vision_delay` | Configured delay, seconds |
+| `vision_time_s` | `time_s - vision_delay`; negative before alignment |
+| `alignment_ready` | Vision epoch has reached the available IMU history; 0 or 1 |
+| `bias_fit_dt_s` | Time admitted to bias fitting this row; 0 while waiting or with fixed bias |
+| `delayed_speed_x/y` | Velocity at the vision epoch; meaningful when aligned |
+| `prediction_delta_v_x/y` | Corrected IMU integral to now; before alignment, integral from time zero |
+| `dt_s` | Integrated elapsed time; row zero is 0 |
+| `weighted_duration_s` | Sum of `w * duration`, the common mean normalizer |
+| `bias_response_xx/xy/yx/yy` | Delayed velocity response to constant BODY bias, seconds |
+
+`weight_sum` now counts shared subinterval weights, not necessarily input
+frames. It is diagnostic only; compare `weighted_duration_s` for the normalizer.
+The velocity panel shows current speed, speed at the vision epoch and the
+window's mean visual speed. All curves use receipt `time_s` on the plot axis.
+
+By default the Python viewer still uses `--dt .05`. Select actual CSV time
+explicitly; it never guesses timestamp units:
+
+```sh
+python velocity_flight_viewer.py flight.csv --time-column timestamp --time-scale .001 \
+  --vision-delay .2 --fade-in 32 --flat 1 --fade-out 1
+# Or a column of elapsed seconds:
+python velocity_flight_viewer.py flight.csv --dt-column dt --vision-delay .2
+```
+
+`.2` is an example, not an estimated delay. Timestamp/dt column settings
+persist when opening/dropping another CSV; that file must have the selected
+column. The Fixed step field is ignored in this mode. The time slider uses
+actual sample times. Non-increasing timestamps, invalid intervals and missing
+columns are rejected without replacing the previous result/export.
+
+Both Python and C++ clip partial oldest intervals. Older Python versions kept
+the full oldest interval, so non-integer window/step ratios can change slightly
+with this update, including at zero delay. Real samples are held constant for
+acceleration/attitude; the code does not recover missing high-rate IMU samples.
 
 ## Verification
 

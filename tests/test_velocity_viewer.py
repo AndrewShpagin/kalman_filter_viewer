@@ -182,10 +182,53 @@ class VelocityModelTests(unittest.TestCase):
         for fade_in, flat, fade_out in ((0, 2, 0), (1, 2, 0), (0, 1, 2), (1, 0, 1), (0.13, 0.11, 0.17)):
             out = viewer.estimate_velocity(data, config(learn_bias=False, fade_in=fade_in,
                                                         flat=flat, fade_out=fade_out))
-            np.testing.assert_allclose(out['velocity'], truth, atol=1e-11)
+            # With a fractional left edge, linear interpolation of position
+            # differs from the quadratic analytic trajectory. Its known error
+            # is a*(original midpoint - clipped midpoint), weighted once.
+            expected = truth.copy()
+            times = np.arange(len(data))*.05
+            for i in range(1, len(data)):
+                left = max(0., times[i]-fade_in-flat-fade_out)
+                k = np.arange(1, i+1)
+                lo = np.maximum(times[k-1], left)
+                valid = times[k] > lo
+                k, lo = k[valid], lo[valid]
+                h = times[k]-lo
+                mid = (times[k]+lo)/2
+                cfg = config(fade_in=fade_in, flat=flat, fade_out=fade_out)
+                weights = viewer.interval_weights(times[i]-mid, times[i]-left, cfg)*h
+                shift = np.average((times[k-1]+times[k])/2-mid, weights=weights)
+                expected[i] += acceleration[i]*shift
+            np.testing.assert_allclose(out['velocity'], expected, atol=1e-11)
+
+    def test_delayed_variable_time_motion_and_causal_prefix(self):
+        dt = np.r_[0., np.resize([1/60, 1/23, 1/37, 1/20, 1/53], 2000)]
+        t = np.cumsum(dt)
+        delay = .237
+        speed = np.column_stack((1.6*np.cos(.8*t), -.6*np.sin(.6*t)))
+        data = np.zeros((len(t), 15)); data[:, 2] = 100.; data[:, 10:] = np.nan
+        data[:, :2] = np.column_stack((2*np.sin(.8*(t-delay)), np.cos(.6*(t-delay))))
+        data[:, 7] = np.sin(.3*t/2); data[:, 8] = np.cos(.3*t/2)
+        data[:, 9] = np.rad2deg(.3*t)
+        rotation, _ = shared.quaternion_matrices(data[:, 5:9])
+        data[1:, 3:5] = np.diff(speed, axis=0)/dt[1:, None]
+        data[:, 3:5] += rotation[:, :2, :2]@np.array([.12, -.08])
+        cfg = config(vision_delay=delay, vx0=1.6, fade_in=.6, flat=.4, fade_out=.3,
+                     bias_memory=4., bias_warmup=2.)
+        result = viewer.estimate_velocity(data, cfg, intervals=dt)
+        np.testing.assert_allclose(result['velocity'][t>30], speed[t>30], atol=.003)
+        np.testing.assert_allclose(result['bias_body'][t>30], np.tile([.12, -.08], (sum(t>30), 1)), atol=.003)
+        np.testing.assert_array_equal(result['bias_body'][t<delay], 0.)
+        self.assertTrue(np.all(result['bias_fit_dt_s'][t<delay] == 0))
+        prefix = viewer.estimate_velocity(data[:300], cfg, intervals=dt[:300])
+        for key in result:
+            np.testing.assert_allclose(result[key][:300], prefix[key], rtol=0, atol=1e-12, err_msg=key)
+        for invalid in (dt[:-1], np.where(t<1, 0, dt), np.full(len(t), np.nan)):
+            with self.assertRaises(ValueError):
+                viewer.estimate_velocity(data, cfg, intervals=invalid)
 
     def test_rejects_invalid_parameters(self):
-        for changes in ({'dt': 0}, {'fade_in': -1}, {'coord_scale': 0},
+        for changes in ({'dt': 0}, {'vision_delay': -1}, {'vision_delay': float('inf')}, {'fade_in': -1}, {'coord_scale': 0},
                         {'lead': float('nan')}, {'bias_warmup': -1}, {'bias_memory': -1},
                         {'bias_memory': float('inf')},
                         {'bias_warmup': float('inf')}, {'fade_in': 0, 'flat': 0, 'fade_out': 0}):
@@ -261,6 +304,33 @@ class VelocityUITests(unittest.TestCase):
             self.assertTrue(v.open_in_plotjuggler())
             self.assertEqual(launch.call_args.args[0], [str(binary), '-d', str(v.export_path.resolve())])
         self.assertIn('estimated_speed_x', v.export_path.read_text().splitlines()[0])
+
+    def test_delay_control_and_timestamp_replay(self):
+        v = self.viewer
+        t = np.r_[0., np.cumsum(np.resize([.02, .05, .017], 60))]
+        source = self.folder/'timed.csv'
+        source.write_text('timestamp;vis_x;vis_y;mheight;acc.x;acc.y;quat.x;quat.y;quat.z;quat.w;yaw\n'
+                          + ''.join(f'{1e9+ti*1000};{ti};{-2*ti};10;0;0;0;0;0;1;0\n' for ti in t),
+                          encoding='utf-8')
+        v.cfg = replace(v.cfg, time_column='timestamp', time_scale=.001)
+        self.assertTrue(v.load_csv(source))
+        v.fields['vision_delay'].set_val('.137')
+        self.assertTrue(v.apply_parameters())
+        np.testing.assert_allclose(v.result['time'], t, atol=1e-9)
+        np.testing.assert_allclose(v.result['velocity'], np.tile([1., -2.], (len(t), 1)), atol=1e-7)
+        v.current_time = t[27]+.001
+        v.draw(force=True)
+        self.assertEqual(v.last_index, 27)
+        with v.export_path.open() as stream:
+            row = list(csv.DictReader(stream, delimiter=';'))[-1]
+        self.assertEqual(float(row['vision_delay']), .137)
+        self.assertIn('delayed_speed_x', row)
+        self.assertIn('prediction_delta_v_x', row)
+        bad = self.folder/'bad_time.csv'
+        bad.write_text(source.read_text().replace(str(1e9+20), str(1e9)), encoding='utf-8')
+        original = v.result
+        self.assertFalse(v.load_csv(bad))
+        self.assertIs(v.result, original)
 
     def test_protects_input_and_failed_load_keeps_flight(self):
         v = self.viewer

@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Compare C++ velocity exports against Python (NumPy required).
 
-Fixed dt calls the unmodified viewer. Variable dt uses its NumPy bias solver
-and independent vectorized window integration with duration-weighted means.
+Fixed and variable dt call the Python viewer, whose vectorized prefix-integral
+implementation is independent of the C++ streaming interval walk. Check delay
+alignment, prediction and all exported diagnostics as well as the old columns.
 No input files are modified; exports are made in a temporary directory.
 """
 from __future__ import annotations
@@ -23,64 +24,15 @@ from compare_with_python import synthetic
 
 
 def variable_reference(data, cfg, dt):
-    attitude = py.check_attitude(data, cfg)
-    out = py.estimate_velocity(data, cfg, attitude)
-    t = np.cumsum(dt.astype(np.longdouble))
-    out['time'] = np.asarray(t, dtype=float)
-    out['dt'] = dt.copy()
-    out['window_span_s'] = np.minimum(out['time'], cfg.fit_window)
-    out['window_complete'] = (t + 1e-12*cfg.fit_window >= cfg.fit_window).astype(float)
-    out['integral_raw'] = np.cumsum(data[:, 3:5]*dt[:, None], axis=0)
-    out['visual_velocity'][1:] = np.diff(out['measured_position'], axis=0)/dt[1:, None]
-    bias = py.BodyBiasEstimator((cfg.bias_x0, cfg.bias_y0), cfg.bias_warmup, cfg.bias_memory)
-    responses = np.zeros((len(data), 2, 2))
-    durations = np.zeros(len(data))
-    for i in range(1, len(data)):
-        left = max(np.longdouble(0), t[i]-cfg.fit_window)
-        start = max(1, int(np.searchsorted(t, left, side='right')))
-        indices = np.arange(start, i+1)
-        h = np.asarray(np.minimum(dt[indices], t[indices]-left), dtype=float)
-        ages = np.asarray(t[i]-t[indices], dtype=float)+h/2
-        w = py.interval_weights(ages, float(t[i]-left), cfg)
-        mass = w*h
-        durations[i] = mass.sum()
-        out['weight_sum'][i] = w.sum()
-        b = bias.bias.copy()
-        m = attitude.rotation[i, :2, :2]
-        projections = attitude.rotation[indices, :2, :2]
-        rotation = np.concatenate((np.zeros((1, 2, 2)), np.cumsum(projections*h[:, None, None], axis=0)))
-        integral = np.vstack((np.zeros(2), np.cumsum((data[indices, 3:5]-projections@b)*h[:, None], axis=0)))
-        delta_pos = out['measured_position'][indices]-out['measured_position'][indices-1]
-        mean_visual = np.einsum('i,ij->j', w*(h/dt[indices]), delta_pos)/mass.sum()
-        mean_inertial = np.einsum('i,ij->j', mass, (integral[:-1]+integral[1:])/2)/mass.sum()
-        response = rotation[-1]-np.einsum('i,ijk->jk', mass, (rotation[:-1]+rotation[1:])/2)/mass.sum()
-        out['bias_body_used'][i] = b
-        out['bias_used'][i] = m@b
-        out['corrected_acceleration'][i] = data[i, 3:5]-m@b
-        out['window_integral'][i] = integral[-1]
-        out['mean_visual_velocity'][i] = mean_visual
-        out['mean_integrated_velocity'][i] = mean_inertial
-        out['normalization_offset'][i] = mean_visual-mean_inertial
-        out['velocity'][i] = integral[-1]+mean_visual-mean_inertial
-        if cfg.learn_bias:
-            h_fit = m-(response-responses[i-1])/dt[i]
-            residual = (data[i, 3:5]*dt[i]-(out['velocity'][i]-out['velocity'][i-1])
-                        -response@b+responses[i-1]@out['bias_body_used'][i-1])
-            bias.update_residual(h_fit, residual, dt[i])
-        out['bias_body'][i] = bias.bias
-        out['bias'][i] = m@bias.bias
-        out['bias_rhs'][i] = bias.rhs
-        out['bias_normal'][i] = bias.normal[0, 0], bias.normal[0, 1], bias.normal[1, 1]
-        responses[i] = response
-    out['forward_position'] = out['measured_position']+cfg.lead*out['velocity']
-    return out, durations, responses
+    out = py.estimate_velocity(data, cfg, intervals=dt)
+    return out, out['weighted_duration_s'], out['bias_response']
 
 
 def compare(exe, source, work, cfg, flags=(), intervals=None):
     output = work/'result_velocity_cpp.csv'
     args = [str(exe), str(source), '--export', str(output)]
     for option, field in (('fade-in', 'fade_in'), ('flat', 'flat'), ('fade-out', 'fade_out'),
-                          ('lead', 'lead'), ('coord-scale', 'coord_scale'), ('bias-warmup', 'bias_warmup'),
+                          ('lead', 'lead'), ('vision-delay', 'vision_delay'), ('coord-scale', 'coord_scale'), ('bias-warmup', 'bias_warmup'),
                           ('bias-memory', 'bias_memory'),
                           ('bias-x0', 'bias_x0'), ('bias-y0', 'bias_y0'), ('vx0', 'vx0'), ('vy0', 'vy0'),
                           ('quat-direction', 'quaternion_direction'), ('yaw-unit', 'yaw_unit')):
@@ -96,7 +48,7 @@ def compare(exe, source, work, cfg, flags=(), intervals=None):
     responses = None
     if intervals is None:
         out = py.estimate_velocity(data, cfg)
-        durations = cfg.dt*out['weight_sum']
+        durations = out['weighted_duration_s']
         dt = np.r_[0., np.full(len(data)-1, cfg.dt)]
     else:
         out, durations, responses = variable_reference(data, cfg, intervals)
@@ -106,7 +58,7 @@ def compare(exe, source, work, cfg, flags=(), intervals=None):
     expected = np.genfromtxt(expected_path, delimiter=';', names=True)
     actual = np.genfromtxt(output, delimiter=';', names=True)
     extras = ('dt_s', 'weighted_duration_s', 'bias_response_xx', 'bias_response_xy', 'bias_response_yx', 'bias_response_yy')
-    assert actual.dtype.names == expected.dtype.names+extras
+    assert actual.dtype.names == expected.dtype.names
     for name in expected.dtype.names:
         np.testing.assert_allclose(actual[name], expected[name], rtol=1e-9, atol=1e-9, err_msg=name)
     np.testing.assert_allclose(actual['dt_s'], dt, rtol=1e-12, atol=1e-12)
@@ -159,6 +111,9 @@ def main():
         compare(exe, source, work, cfg, ['--dt-column', 'elapsed'], dt)
         compare(exe, source, work, cfg, ['--time-column', 'timestamp', '--time-scale', '.001'], dt)
         compare(exe, source, work, replace(cfg, fade_in=0, flat=.13, fade_out=0), ['--dt-column', 'elapsed'], dt)
+        for delay in (.137, 8.123):
+            compare(exe, source, work, replace(cfg, vision_delay=delay))
+            compare(exe, source, work, replace(cfg, vision_delay=delay), ['--dt-column', 'elapsed'], dt)
         synthetic(source, inverse=True)
         compare(exe, source, work, cfg)
         compare(exe, source, work, replace(cfg, quaternion_direction='ned-to-body', yaw_unit='rad'))

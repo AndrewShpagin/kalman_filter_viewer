@@ -4,7 +4,7 @@ Desktop viewer for horizontal drone flight data from semicolon-separated CSV fil
 
 The repository also includes a [C++17 header-only filter and CSV runner](cpp/README.md), with per-sample time intervals and dynamically adjustable noise. The runner exports `result_cpp.csv` with the same columns as the Python viewer, plus `dt_s` and `sigma_acc`.
 
-An independent [experimental velocity viewer](VELOCITY_VIEWER.md) estimates speed by integrating bias-corrected acceleration and matching its window mean to visual speed. Its [standalone C++17 class and CSV runner](cpp/VELOCITY.md) support variable time steps and the same body-bias startup ramp. Run `python velocity_flight_viewer.py` to open its CSV replay window, or pass a CSV filename. It exports `result_velocity.csv` and plots `vis + lead * estimated_speed` with a default lead of one second.
+An independent [experimental velocity viewer](VELOCITY_VIEWER.md) estimates speed by integrating bias-corrected acceleration and matching its window mean to visual speed. Its [standalone C++17 class and CSV runner](cpp/VELOCITY.md) support variable time steps and the same body-bias startup ramp. Run `python velocity_flight_viewer.py` to open its CSV replay window, or pass a CSV filename. It exports `result_velocity.csv` and plots `vis + lead * estimated_speed` with a default lead of one second. Both versions support a manual `vision_delay` (GUI field / `--vision-delay`) and align vision with historical IMU data before learning bias. Python also accepts `--time-column timestamp --time-scale .001` or `--dt-column dt` for irregular sample intervals.
 
 ## Install
 

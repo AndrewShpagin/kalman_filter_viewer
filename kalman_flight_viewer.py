@@ -695,6 +695,9 @@ class FlightViewer:
     def status_details(self, index):
         return f'sigma_position={self.result["sigma_position"][index]:.2f} m'
 
+    def read_input(self, path, cfg):
+        return read_flight(path)
+
     def run_estimate(self, data, cfg, attitude):
         return estimate(data, cfg, attitude)
 
@@ -841,7 +844,7 @@ class FlightViewer:
             self.button.label.set_text('Play')
             self.fig.canvas.draw_idle()
             return
-        index = min(int((self.current_time + 1e-9) / self.cfg.dt), len(result['time']) - 1)
+        index = max(0, min(int(np.searchsorted(result['time'], self.current_time + 1e-9, side='right')) - 1, len(result['time']) - 1))
         if not force and index == self.last_index:
             return
         self.last_index = index
@@ -877,8 +880,8 @@ class FlightViewer:
         if self.result is None:
             self.status.set_text('No CSV loaded')
         else:
-            index = min(int((self.current_time + 1e-9) / self.cfg.dt),
-                        len(self.result['time']) - 1)
+            index = max(0, min(int(np.searchsorted(self.result['time'], self.current_time + 1e-9, side='right')) - 1,
+                               len(self.result['time']) - 1))
             mode = 'Paused' if self.paused else 'Playing'
             if index == len(self.result['time']) - 1:
                 mode = 'End'
@@ -1153,7 +1156,7 @@ class FlightViewer:
             self.message.set_color('#555555')
             self.message.set_text(f'Opening {path.name[:70]} and saving CSV...')
             self.fig.canvas.draw()
-            data, _ = read_flight(path)
+            data, _ = self.read_input(path, cfg)
             attitude = check_attitude(data, cfg)
             result = self.run_estimate(data, cfg, attitude)
             self.save_estimates(export_path, result)

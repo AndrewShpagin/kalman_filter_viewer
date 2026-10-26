@@ -18,6 +18,7 @@ void help() {
   --fade-in SECONDS             Oldest fade (6)
   --flat SECONDS                Middle plateau (6)
   --fade-out SECONDS            Newest fade (6)
+  --vision-delay SECONDS        Vision age relative to IMU (0); exact time shift
   --lead SECONDS                Forward position horizon (1)
   --coord-scale FACTOR          Vision position multiplier (1)
   --bias-warmup SECONDS         Minimum bias information time (6; 0 disables)
@@ -60,6 +61,7 @@ Options parse(const std::vector<std::string>& args) {
         else if (arg == "--fade-in") o.parameters.fade_in = realNumber(value, arg);
         else if (arg == "--flat") o.parameters.flat = realNumber(value, arg);
         else if (arg == "--fade-out") o.parameters.fade_out = realNumber(value, arg);
+        else if (arg == "--vision-delay") o.parameters.vision_delay = realNumber(value, arg);
         else if (arg == "--lead") o.parameters.lead = realNumber(value, arg);
         else if (arg == "--coord-scale") o.parameters.coordinate_scale = realNumber(value, arg);
         else if (arg == "--bias-warmup") o.parameters.bias_warmup = realNumber(value, arg);
@@ -112,7 +114,8 @@ void write(const Options& o, const std::vector<Row>& rows,
     out << ";niacc.x;niacc.y";
     for (const char* axis : {"x", "y", "z", "w"}) out << ";quat_" << axis << "_normalized_input";
     out << ";yaw_csv_deg;yaw_quat_deg;yaw_error_deg;bias_fit_normal_xx;bias_fit_normal_xy;bias_fit_normal_yy";
-    out << ";dt_s;weighted_duration_s;bias_response_xx;bias_response_xy;bias_response_yx;bias_response_yy\n";
+    out << ";dt_s;weighted_duration_s;bias_response_xx;bias_response_xy;bias_response_yx;bias_response_yy";
+    out << ";vision_delay;vision_time_s;alignment_ready;bias_fit_dt_s;delayed_speed_x;delayed_speed_y;prediction_delta_v_x;prediction_delta_v_y\n";
     const auto& p = o.parameters;
     for (std::size_t i = 0; i < rows.size(); ++i) {
         const auto& s = states[i];
@@ -140,6 +143,8 @@ void write(const Options& o, const std::vector<Row>& rows,
         for (double value : s.bias_normal) out << ';' << value;
         out << ';' << s.dt_s << ';' << s.weighted_duration_s;
         for (const auto& row : s.bias_response) for (double x : row) out << ';' << x;
+        out << ';' << p.vision_delay << ';' << s.vision_time_s << ';' << s.alignment_ready << ';' << s.bias_fit_dt_s;
+        for (const auto& v : {s.delayed_velocity, s.prediction_delta_velocity}) for (double x : v) out << ';' << x;
         out << '\n';
     }
     out.close();
